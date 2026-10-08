@@ -1,4 +1,5 @@
-﻿FROM mcr.microsoft.com/dotnet/runtime:8.0 AS base
+﻿# aspnet rather than runtime: the console app hosts the optional web UI (WEBUI_PORT)
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
 
 RUN apt-get update && apt-get install -y \
     curl gnupg && \
@@ -29,5 +30,8 @@ COPY --from=publish /app/publish .
 ENV INSIDE_DOCKER=true
 
 VOLUME ["/app/Configuration"]
+
+# Only used when WEBUI_PORT=8080 is set
+EXPOSE 8080
 
 ENTRYPOINT ["dotnet", "TwitchDropsBot.Console.dll"]
