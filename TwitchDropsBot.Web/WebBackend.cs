@@ -26,9 +26,19 @@ public sealed partial class WebBackend
 {
     private static readonly TimeSpan EndedQueueGrace = TimeSpan.FromHours(1);
     private static readonly TimeSpan ErrorShownFor = TimeSpan.FromHours(6);
+    private static readonly TimeSpan DetailStatusAge = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan ForcedStatusAge = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan StatusTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>How long a channel check stands before the background pass asks again.</summary>
+    public static readonly TimeSpan RecheckAfter = TimeSpan.FromHours(3);
+
+    /// <summary>How long after a failed channel check (no live channel, no answer) to try again.</summary>
+    public static readonly TimeSpan RetryAfter = TimeSpan.FromMinutes(30);
 
     private readonly IAccountSource _source;
     private readonly ConcurrentDictionary<string, string> _boxArtByGame = new();
+    private int _scanCursor;
 
     public WebBackend(IAccountSource source, string version, bool demo)
     {
@@ -41,8 +51,10 @@ public sealed partial class WebBackend
     public string Version { get; }
     public bool IsDemo { get; }
 
-    /// <summary>Raised when the queue changes or a switch is requested, so the state is pushed at once.</summary>
+    /// <summary>Raised when the queue changes, a switch is requested or a status check lands.</summary>
     public event Action? Changed;
+
+    public void NotifyChanged() => Changed?.Invoke();
 
     public StateDto GetState()
     {
@@ -57,6 +69,8 @@ public sealed partial class WebBackend
             return null;
         }
 
+        // Read before building, so a change made meanwhile makes the page fetch the list again
+        var version = CampaignsVersion(account);
         var context = new AccountContext(this, account);
         var campaigns = account.Campaigns
             .Select(context.BuildCampaign)
@@ -64,8 +78,12 @@ public sealed partial class WebBackend
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        return new CampaignListDto(account.CampaignsAt, campaigns);
+        return new CampaignListDto(Utc(account.CampaignsAt), version, campaigns);
     }
+
+    // Changes when the bot fetches a new list or a campaign's progress may read differently
+    private static string CampaignsVersion(IAccount account) =>
+        $"{Utc(account.CampaignsAt)?.Ticks ?? 0}.{account.StatusVersion}";
 
     public async Task<BackendResult> RefreshCampaignsAsync(string accountId, CancellationToken cancellationToken)
     {
@@ -88,7 +106,7 @@ public sealed partial class WebBackend
         return BackendResult.Ok(GetCampaigns(accountId));
     }
 
-    public async Task<BackendResult> GetCampaignAsync(string accountId, string campaignId,
+    public async Task<BackendResult> GetCampaignAsync(string accountId, string campaignId, bool recheck,
         CancellationToken cancellationToken)
     {
         var account = Find(accountId);
@@ -111,6 +129,22 @@ public sealed partial class WebBackend
         catch (Exception e) when (e is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             details = null;
+        }
+
+        // The inventory and the live watch already say where an open campaign stands; otherwise ask a live channel
+        var watching = account.Status == BotStatus.Watching && account.CurrentCampaign?.Id == campaignId;
+        var inInventory = account.Inventory?.DropCampaignsInProgress.Any(x => x.Id == campaignId) == true;
+        if (listed is DropCampaign && !watching && !inInventory)
+        {
+            try
+            {
+                await account.CheckStatusAsync(campaignId, recheck ? ForcedStatusAge : DetailStatusAge,
+                    cancellationToken).WaitAsync(StatusTimeout, cancellationToken);
+                Changed?.Invoke();
+            }
+            catch (Exception e) when (e is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+            }
         }
 
         var context = new AccountContext(this, account);
@@ -226,7 +260,7 @@ public sealed partial class WebBackend
         return Find(accountId)?.Logs.After(after);
     }
 
-    /// <summary>Drops queue entries whose campaign ended over an hour ago.</summary>
+    /// <summary>Drops queue entries whose campaign ended over an hour ago, and old finished campaigns.</summary>
     public void Maintain()
     {
         var cutoff = DateTime.UtcNow - EndedQueueGrace;
@@ -234,6 +268,53 @@ public sealed partial class WebBackend
         {
             _source.Queue.RemoveWhere(account.Id, x => x.EndAt is { } end && Utc(end) < cutoff);
         }
+
+        _source.Store.Prune();
+    }
+
+    /// <summary>
+    /// The next campaign whose progress the background pass should ask a live channel about: queued ones first,
+    /// then favourites by end date, alternating between accounts. Others are checked when opened.
+    /// </summary>
+    public (IAccount Account, string CampaignId)? NextStatusCheck()
+    {
+        var accounts = _source.Accounts;
+        for (var i = 0; i < accounts.Count; i++)
+        {
+            var index = (_scanCursor + i) % accounts.Count;
+            if (StatusCandidates(accounts[index]).FirstOrDefault() is { } campaignId)
+            {
+                _scanCursor = (index + 1) % accounts.Count;
+                return (accounts[index], campaignId);
+            }
+        }
+
+        return null;
+    }
+
+    private IEnumerable<string> StatusCandidates(IAccount account)
+    {
+        var now = DateTime.UtcNow;
+        var campaigns = account.Campaigns.OfType<DropCampaign>().ToList();
+        var inventory = (account.Inventory?.DropCampaignsInProgress ?? new List<DropCampaign>())
+            .Select(x => x.Id).ToHashSet();
+        var favourites = account.FavouriteGames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        bool Needed(DropCampaign campaign) =>
+            !(account.Status == BotStatus.Watching && account.CurrentCampaign?.Id == campaign.Id) &&
+            !inventory.Contains(campaign.Id) &&
+            !account.IsKnownDone(campaign.Id) &&
+            !(account.CheckedStatus.TryGetValue(campaign.Id, out var status) && now - status.CheckedAt < RecheckAfter) &&
+            !(account.StatusAttempts.TryGetValue(campaign.Id, out var attempt) && now - attempt.At < RetryAfter);
+
+        var queued = _source.Queue.GetCampaignIds(account.Id)
+            .Select(id => campaigns.FirstOrDefault(x => x.Id == id))
+            .OfType<DropCampaign>();
+        var favourite = campaigns
+            .Where(x => GameName(x) is { } game && favourites.Contains(game))
+            .OrderBy(x => EndOf(x) ?? DateTime.MaxValue);
+
+        return queued.Concat(favourite).Where(Needed).Select(x => x.Id).Distinct();
     }
 
     private IAccount? Find(string accountId) =>
@@ -287,6 +368,7 @@ public sealed partial class WebBackend
             lastError,
             context.BuildQueue(),
             Utc(account.CampaignsAt),
+            CampaignsVersion(account),
             account.Campaigns.Count,
             account.OnlyFavouriteGames);
     }
@@ -333,6 +415,9 @@ public sealed partial class WebBackend
     [GeneratedRegex(@"(\{width\}x\{height\}|\d+x\d+)(?=\.(jpg|jpeg|png|webp)$)", RegexOptions.IgnoreCase)]
     private static partial Regex SizeRegex();
 
+    /// <summary>Where one campaign stands for one account, from the best source available.</summary>
+    private sealed record Resolved(string State, CampaignStatus? Status, bool NeedsLink);
+
     /// <summary>Per-request view of one account: its queue, progress and notes looked up once.</summary>
     private sealed class AccountContext
     {
@@ -363,6 +448,67 @@ public sealed partial class WebBackend
 
         private bool IsWatching(string campaignId) =>
             _account.Status == BotStatus.Watching && _account.CurrentCampaign?.Id == campaignId;
+
+        // The live watch, then the inventory (campaigns in progress), then a live channel's answer, then what
+        // earlier checks and the bot recorded. Twitch drops fully claimed campaigns from the inventory.
+        private Resolved Resolve(AbstractCampaign campaign)
+        {
+            var id = campaign.Id;
+            CampaignStatus? status = null;
+
+            if (IsWatching(id) && _account.CurrentDropsProgress is { Count: > 0 } live)
+            {
+                var tiers = live.Where(x => x.RequiredProgress > 0).Select(x => new TierStatus(
+                        x.Name, x.ImageUrl, (int)Math.Min(x.CurrentProgress, x.RequiredProgress),
+                        (int)x.RequiredProgress, x.IsClaimed))
+                    .ToList();
+                status = new CampaignStatus(id, tiers, DateTime.UtcNow, "live",
+                    _account.CurrentBroadcaster?.DisplayName ?? _account.CurrentBroadcaster?.Login);
+            }
+            else if (_inventory.TryGetValue(id, out var tracked))
+            {
+                status = CampaignStatus.FromInventory(tracked, Utc(_account.CampaignsAt) ?? DateTime.UtcNow);
+            }
+            else if (_account.CheckedStatus.TryGetValue(id, out var checkedStatus))
+            {
+                status = checkedStatus;
+            }
+
+            var needsLink = campaign is DropCampaign drop && !drop.CanReceiveRewards();
+            var done = _account.IsKnownDone(id) ||
+                       _account.Notes.TryGetValue(id, out var note) && note.Kind == CampaignNoteKind.Completed;
+
+            if (status is { AllClaimed: true })
+            {
+                if (!done)
+                {
+                    _account.MarkDone(id, EndOf(campaign));
+                }
+
+                return new Resolved("done", status, needsLink);
+            }
+
+            // A campaign without timed drops (subscriptions only, say) has no minutes to report
+            if (status is null || status.Tiers.Count == 0)
+            {
+                return new Resolved(done ? "done" : "unknown", null, needsLink);
+            }
+
+            var state = status.Waiting > 0 ? "waitingClaim" : status.Started ? "inProgress" : "notStarted";
+            return new Resolved(state, status, needsLink);
+        }
+
+        private static ProgressDto? Progress(CampaignStatus? status)
+        {
+            if (status is null || status.Tiers.Count == 0)
+            {
+                return null;
+            }
+
+            var next = status.Tiers.FirstOrDefault(x => !x.Claimed && x.Current < x.Required) ?? status.Tiers[^1];
+            return new ProgressDto(Math.Min(next.Current, next.Required), next.Required,
+                status.Tiers.Count(x => x.Claimed), status.Tiers.Count, status.Waiting);
+        }
 
         public WatchingDto BuildWatching()
         {
@@ -405,7 +551,7 @@ public sealed partial class WebBackend
             return _queue.Select(item =>
             {
                 var campaign = _campaigns.GetValueOrDefault(item.CampaignId);
-                var progress = Progress(item.CampaignId);
+                var resolved = campaign is null ? null : Resolve(campaign);
                 var note = Note(item.CampaignId);
 
                 string state;
@@ -417,14 +563,14 @@ public sealed partial class WebBackend
                 {
                     state = item.EndAt is { } end && Utc(end) < now ? "ended" : "unavailable";
                 }
-                else if (progress is { Total: > 0 } && progress.Claimed >= progress.Total ||
-                         note?.Kind == nameof(CampaignNoteKind.Completed))
-                {
-                    state = "done";
-                }
                 else
                 {
-                    state = "queued";
+                    state = resolved!.State switch
+                    {
+                        "done" => "done",
+                        "waitingClaim" => "waitingClaim",
+                        _ => "queued"
+                    };
                 }
 
                 return new QueueItemDto(
@@ -435,7 +581,8 @@ public sealed partial class WebBackend
                     campaign is null ? Utc(item.EndAt) : EndOf(campaign),
                     state,
                     note,
-                    progress);
+                    Progress(resolved?.Status),
+                    resolved?.NeedsLink ?? false);
             }).ToList();
         }
 
@@ -453,6 +600,7 @@ public sealed partial class WebBackend
 
             var (link, linkUrl) = LinkState(campaign);
             var gameName = GameName(campaign);
+            var resolved = Resolve(campaign);
 
             return new CampaignDto(
                 campaign.Id,
@@ -469,8 +617,12 @@ public sealed partial class WebBackend
                 IsWatching(campaign.Id),
                 queueIndex >= 0 ? queueIndex + 1 : null,
                 TotalMinutes(campaign),
-                Progress(campaign.Id),
-                Note(campaign.Id));
+                Progress(resolved.Status),
+                Note(campaign.Id),
+                resolved.State,
+                resolved.NeedsLink,
+                resolved.Status?.Source,
+                resolved.Status is { Source: not "live" } ? Utc(resolved.Status.CheckedAt) : null);
         }
 
         public CampaignDetailDto BuildDetail(AbstractCampaign listed, AbstractCampaign details)
@@ -481,48 +633,41 @@ public sealed partial class WebBackend
                 summary = summary with { TotalMinutes = total };
             }
 
+            var resolved = Resolve(listed);
             var tiers = new List<TierDto>();
-            if (details is RewardCampaign reward)
+
+            if (resolved.Status is { Tiers.Count: > 0 } status)
+            {
+                var activeSet = false;
+                foreach (var tier in status.Tiers)
+                {
+                    var active = !activeSet && !tier.Claimed && tier.Current < tier.Required;
+                    activeSet |= active;
+                    tiers.Add(new TierDto(tier.Name, tier.ImageUrl, tier.Current, tier.Required, tier.Claimed, active));
+                }
+            }
+            else if (details is RewardCampaign reward)
             {
                 var goal = reward.UnlockRequirements?.MinuteWatchedGoal ?? 0;
                 tiers.AddRange(reward.Rewards.Select(x => new TierDto(x.Name ?? "Reward",
-                    x.ThumbnailImage?.Image1xURL, 0, goal, false, false)));
+                    x.ThumbnailImage?.Image1xURL, null, goal, false, false)));
             }
             else
             {
-                var inventory = _inventory.GetValueOrDefault(listed.Id);
-                var drops = details.TimeBasedDrops
-                    .Where(x => x.RequiredMinutesWatched > 0)
-                    .OrderBy(x => x.RequiredMinutesWatched)
-                    .ToList();
-
-                var activeSet = false;
-                foreach (var drop in drops)
+                // Nothing known about this account's progress: the drops as Twitch lists them
+                var done = resolved.State == "done";
+                foreach (var drop in details.TimeBasedDrops.Where(x => x.RequiredMinutesWatched > 0)
+                             .OrderBy(x => x.RequiredMinutesWatched))
                 {
-                    var tracked = inventory?.TimeBasedDrops.FirstOrDefault(x => x.Id == drop.Id);
-                    var self = tracked?.Self ?? drop.Self;
-                    var current = self?.CurrentMinutesWatched ?? 0;
-                    var claimed = self?.IsClaimed ?? false;
-
-                    // The bot's live minutes are fresher than the inventory for the drop it is watching
-                    if (IsWatching(listed.Id) && _account.RequiredMinutesWatched == drop.RequiredMinutesWatched &&
-                        _account.CurrentMinutesWatched is { } live)
-                    {
-                        current = Math.Max(current, live);
-                    }
-
-                    var active = !activeSet && !claimed && current < drop.RequiredMinutesWatched;
-                    activeSet |= active;
-
                     var benefit = drop.BenefitEdges.FirstOrDefault()?.Benefit;
                     tiers.Add(new TierDto(benefit?.Name ?? drop.Name ?? "Drop", benefit?.ImageAssetURL,
-                        Math.Min(current, drop.RequiredMinutesWatched), drop.RequiredMinutesWatched, claimed,
-                        active));
+                        done ? drop.RequiredMinutesWatched : null, drop.RequiredMinutesWatched, done, false));
                 }
             }
 
             var channels = details.Allow?.Channels;
             var restricted = channels is { Count: > 0 and < 250 };
+            var attempt = _account.StatusAttempts.GetValueOrDefault(listed.Id);
 
             return new CampaignDetailDto(
                 summary,
@@ -533,44 +678,9 @@ public sealed partial class WebBackend
                 restricted ? channels!.Count : 0,
                 (details as DropCampaign)?.DetailsURL ?? (listed as DropCampaign)?.DetailsURL,
                 CannotQueueReason(listed) is null,
-                CannotQueueReason(listed));
-        }
-
-        private ProgressDto? Progress(string campaignId)
-        {
-            if (IsWatching(campaignId) && _account.CurrentDropsProgress is { Count: > 0 } live)
-            {
-                var timed = live.Where(x => x.RequiredProgress > 0).ToList();
-                if (timed.Count > 0)
-                {
-                    var next = timed.FirstOrDefault(x => x.IsActive) ??
-                               timed.FirstOrDefault(x => !x.IsClaimed) ?? timed.Last();
-                    return new ProgressDto((int)Math.Min(next.CurrentProgress, next.RequiredProgress),
-                        (int)next.RequiredProgress, timed.Count(x => x.IsClaimed), timed.Count);
-                }
-            }
-
-            if (!_inventory.TryGetValue(campaignId, out var inventory))
-            {
-                return null;
-            }
-
-            var drops = inventory.TimeBasedDrops
-                .Where(x => x.RequiredMinutesWatched > 0)
-                .OrderBy(x => x.RequiredMinutesWatched)
-                .ToList();
-            if (drops.Count == 0)
-            {
-                return null;
-            }
-
-            var target = drops.FirstOrDefault(x => x.Self?.IsClaimed != true &&
-                                                   (x.Self?.CurrentMinutesWatched ?? 0) < x.RequiredMinutesWatched)
-                         ?? drops.Last();
-            var watched = Math.Min(target.Self?.CurrentMinutesWatched ?? 0, target.RequiredMinutesWatched);
-
-            return new ProgressDto(watched, target.RequiredMinutesWatched,
-                drops.Count(x => x.Self?.IsClaimed == true), drops.Count);
+                CannotQueueReason(listed),
+                resolved.Status?.Channel,
+                resolved.Status is null ? attempt?.Problem : null);
         }
 
         private NoteDto? Note(string campaignId) =>
@@ -589,7 +699,7 @@ public sealed partial class WebBackend
             return timed.Count > 0 ? timed.Max(x => x.RequiredMinutesWatched) : null;
         }
 
-        // Twitch reports isAccountConnected false for campaigns that need no link, whose link URL is twitch.tv itself
+        // The bot's own rule: Twitch reports isAccountConnected false for campaigns that need no link
         private static (string Link, string? Url) LinkState(AbstractCampaign campaign)
         {
             if (campaign is not DropCampaign drop)
@@ -602,15 +712,7 @@ public sealed partial class WebBackend
                 return ("linked", null);
             }
 
-            var url = drop.AccountLinkURL;
-            if (string.IsNullOrWhiteSpace(url) ||
-                Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
-                uri.Host is "twitch.tv" or "www.twitch.tv" && uri.AbsolutePath.Trim('/').Length == 0)
-            {
-                return ("none", null);
-            }
-
-            return ("unlinked", url);
+            return drop.RequiresAccountLink() ? ("unlinked", drop.AccountLinkURL) : ("none", null);
         }
     }
 }

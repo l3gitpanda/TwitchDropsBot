@@ -1,4 +1,4 @@
-﻿# aspnet rather than runtime: the console app hosts the optional web UI (WEBUI_PORT)
+﻿# aspnet rather than runtime: the console app hosts the optional web UI (WEBUI_ENABLED)
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
 
 RUN apt-get update && apt-get install -y \
@@ -29,9 +29,12 @@ WORKDIR /app
 COPY --from=publish /app/publish .
 ENV INSIDE_DOCKER=true
 
+# The web UI stays off unless WEBUI_ENABLED=true is set; see TwitchDropsBot.Web/README.md
+ENV WEBUI_ENABLED=false
+
 VOLUME ["/app/Configuration"]
 
-# Only used when WEBUI_PORT=8080 is set
+# The web UI's port, when it is on
 EXPOSE 8080
 
 ENTRYPOINT ["dotnet", "TwitchDropsBot.Console.dll"]

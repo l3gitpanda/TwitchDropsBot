@@ -15,6 +15,7 @@ public record AccountDto(
     ErrorDto? LastError,
     IReadOnlyList<QueueItemDto> Queue,
     DateTime? CampaignsUpdatedAt,
+    string CampaignsVersion,
     int CampaignCount,
     bool OnlyFavourites);
 
@@ -33,7 +34,8 @@ public record WatchingDto(
     DateTime? CampaignEndsAt,
     IReadOnlyList<TierDto> Tiers);
 
-public record TierDto(string Name, string? ImageUrl, int Current, int Required, bool Claimed, bool Active);
+/// <summary>One drop of a campaign. Current is null when this account's progress on it isn't known.</summary>
+public record TierDto(string Name, string? ImageUrl, int? Current, int Required, bool Claimed, bool Active);
 
 public record CheckingDto(string CampaignName, string? GameName);
 
@@ -41,7 +43,7 @@ public record ErrorDto(string Message, DateTime At);
 
 public record NoteDto(string Kind, DateTime At);
 
-public record ProgressDto(int Watched, int Required, int Claimed, int Total);
+public record ProgressDto(int Watched, int Required, int Claimed, int Total, int Waiting);
 
 public record QueueItemDto(
     string CampaignId,
@@ -51,9 +53,10 @@ public record QueueItemDto(
     DateTime? EndsAt,
     string State,
     NoteDto? Note,
-    ProgressDto? Progress);
+    ProgressDto? Progress,
+    bool NeedsLink);
 
-public record CampaignListDto(DateTime? UpdatedAt, IReadOnlyList<CampaignDto> Campaigns);
+public record CampaignListDto(DateTime? UpdatedAt, string Version, IReadOnlyList<CampaignDto> Campaigns);
 
 public record CampaignDto(
     string Id,
@@ -71,7 +74,11 @@ public record CampaignDto(
     int? QueuePosition,
     int? TotalMinutes,
     ProgressDto? Progress,
-    NoteDto? Note);
+    NoteDto? Note,
+    string Status,
+    bool NeedsLink,
+    string? StatusSource,
+    DateTime? StatusCheckedAt);
 
 public record CampaignDetailDto(
     CampaignDto Campaign,
@@ -80,7 +87,9 @@ public record CampaignDetailDto(
     int ChannelCount,
     string? DetailsUrl,
     bool CanQueue,
-    string? CannotQueueReason);
+    string? CannotQueueReason,
+    string? StatusChannel,
+    string? StatusProblem);
 
 public record LogLineDto(long Seq, DateTime At, string Level, string Message);
 

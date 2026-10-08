@@ -132,9 +132,9 @@ public static class ApiEndpoints
                 CancellationToken cancellationToken) =>
             ToResult(await backend.RefreshCampaignsAsync(accountId, cancellationToken)));
 
-        account.MapGet("/campaigns/{campaignId}", async (string accountId, string campaignId, WebBackend backend,
-                CancellationToken cancellationToken) =>
-            ToResult(await backend.GetCampaignAsync(accountId, campaignId, cancellationToken)));
+        account.MapGet("/campaigns/{campaignId}", async (string accountId, string campaignId, bool? recheck,
+                WebBackend backend, CancellationToken cancellationToken) =>
+            ToResult(await backend.GetCampaignAsync(accountId, campaignId, recheck == true, cancellationToken)));
 
         account.MapPost("/queue", (string accountId, QueueRequest request, WebBackend backend) =>
             ToResult(backend.AddToQueue(accountId, request)));

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using Serilog.Events;
 using TwitchDropsBot.Core.Platform.Shared.Bots;
@@ -21,18 +22,22 @@ public sealed class DemoAccountSource : IAccountSource, IDisposable
     {
         var queuePath = Path.Combine(Path.GetTempPath(), $"tdb-demo-queue-{Environment.ProcessId}.json");
         Queue = new CampaignQueueService(loggerFactory.CreateLogger<CampaignQueueService>(), queuePath);
+        var statusDirectory = Directory.CreateTempSubdirectory("tdb-demo-status").FullName;
+        Store = new CampaignStatusStore(statusDirectory, loggerFactory.CreateLogger<CampaignStatusStore>());
 
         var catalogue = DemoCatalogue.Build();
         _accounts = new List<DemoAccount>
         {
-            new("100000001", "ana_demo", catalogue, Queue, DemoCatalogue.FirstAccountSetup),
-            new("100000002", "ben_demo", catalogue, Queue, DemoCatalogue.SecondAccountSetup)
+            new("100000001", "ana_demo", catalogue, Queue, Store, DemoCatalogue.FirstAccountSetup),
+            new("100000002", "ben_demo", catalogue, Queue, Store, DemoCatalogue.SecondAccountSetup)
         };
 
         _timer = new Timer(_ => Step(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
     }
 
     public CampaignQueueService Queue { get; }
+
+    public CampaignStatusStore Store { get; }
 
     public IReadOnlyList<IAccount> Accounts => _accounts;
 
@@ -56,22 +61,29 @@ internal sealed class DemoAccount : IAccount
     private readonly Dictionary<string, int[]> _progress = new();   // campaign id -> minutes per tier
     private readonly HashSet<string> _offline;
     private readonly HashSet<string> _linked;
+    private readonly HashSet<string> _unclaimed;
+    private readonly CampaignStatusStore _store;
+    private readonly ConcurrentDictionary<string, CampaignStatus> _checked = new();
+    private readonly ConcurrentDictionary<string, StatusAttempt> _attempts = new();
+    private long _statusVersion;
 
     private bool _reselect;
     private DateTime _phaseUntil;
 
     public DemoAccount(string id, string login, List<AbstractCampaign> catalogue, CampaignQueueService queue,
-        Action<DemoSetup> setup)
+        CampaignStatusStore store, Action<DemoSetup> setup)
     {
         Id = id;
         Login = login;
         _queue = queue;
+        _store = store;
 
         var options = new DemoSetup();
         setup(options);
 
         _offline = options.Offline;
         _linked = options.Linked;
+        _unclaimed = options.Unclaimed;
         _campaigns = catalogue.Select(x => DemoCatalogue.ForAccount(x, _linked)).ToList();
         FavouriteGames = DemoCatalogue.Favourites;
 
@@ -99,6 +111,20 @@ internal sealed class DemoAccount : IAccount
 
         CampaignsAt = DateTime.UtcNow.AddMinutes(-4);
 
+        // As if earlier checks had asked live channels about these
+        foreach (var (campaignId, minutesAgo) in options.Checked)
+        {
+            var status = StatusOf(_campaigns.First(x => x.Id == campaignId)) with
+            {
+                CheckedAt = DateTime.UtcNow.AddMinutes(-minutesAgo)
+            };
+            _checked[campaignId] = status;
+            if (status.AllClaimed)
+            {
+                MarkDone(campaignId, _campaigns.First(x => x.Id == campaignId).EndAt);
+            }
+        }
+
         if (options.Watching is { } watching)
         {
             Watch(_campaigns.First(x => x.Id == watching), options.Channel);
@@ -114,6 +140,71 @@ internal sealed class DemoAccount : IAccount
     public LogBuffer Logs { get; } = new();
 
     public string? KnownBoxArt(string? gameId) => null;
+
+    public IReadOnlyDictionary<string, CampaignStatus> CheckedStatus => _checked;
+
+    public IReadOnlyDictionary<string, StatusAttempt> StatusAttempts => _attempts;
+
+    public long StatusVersion => Interlocked.Read(ref _statusVersion);
+
+    public bool IsKnownDone(string campaignId) => _store.IsDone(Id, campaignId);
+
+    public void MarkDone(string campaignId, DateTime? endAt) => _store.MarkDone(Id, campaignId, endAt);
+
+    public async Task<CampaignStatus?> CheckStatusAsync(string campaignId, TimeSpan maxAge,
+        CancellationToken cancellationToken)
+    {
+        if (_checked.TryGetValue(campaignId, out var known) && DateTime.UtcNow - known.CheckedAt < maxAge)
+        {
+            return known;
+        }
+
+        var campaign = _campaigns.FirstOrDefault(x => x.Id == campaignId);
+        if (campaign is not DropCampaign)
+        {
+            return known;
+        }
+
+        await Task.Delay(400, cancellationToken);
+        if (_offline.Contains(campaignId))
+        {
+            _attempts[campaignId] = new StatusAttempt(DateTime.UtcNow, "No live channel to check right now");
+            return known;
+        }
+
+        CampaignStatus status;
+        lock (_lock)
+        {
+            status = StatusOf(campaign);
+        }
+
+        if (!_checked.TryGetValue(campaignId, out var previous) || !previous.Tiers.SequenceEqual(status.Tiers))
+        {
+            Interlocked.Increment(ref _statusVersion);
+        }
+
+        _checked[campaignId] = status;
+        _attempts[campaignId] = new StatusAttempt(DateTime.UtcNow, null);
+        if (status.AllClaimed)
+        {
+            MarkDone(campaignId, campaign.EndAt);
+        }
+
+        return status;
+    }
+
+    // What a live channel would report: minutes per drop, claimed unless the account can't receive it
+    private CampaignStatus StatusOf(AbstractCampaign campaign)
+    {
+        var minutes = _progress.GetValueOrDefault(campaign.Id) ?? new int[campaign.TimeBasedDrops.Count];
+        return new CampaignStatus(campaign.Id, campaign.TimeBasedDrops.Select((drop, i) => new TierStatus(
+            drop.BenefitEdges[0].Benefit!.Name ?? drop.Name ?? "Drop",
+            drop.BenefitEdges[0].Benefit!.ImageAssetURL,
+            Math.Min(minutes[i], drop.RequiredMinutesWatched),
+            drop.RequiredMinutesWatched,
+            minutes[i] >= drop.RequiredMinutesWatched && !_unclaimed.Contains(campaign.Id))).ToList(),
+            DateTime.UtcNow, "channel", DemoCatalogue.ChannelFor(campaign));
+    }
 
     public string Id { get; }
     public string Login { get; }
@@ -154,7 +245,7 @@ internal sealed class DemoAccount : IAccount
             {
                 return new Inventory
                 {
-                    DropCampaignsInProgress = _progress.Select(x =>
+                    DropCampaignsInProgress = _progress.Where(x => !StatusOf(_campaigns.First(c => c.Id == x.Key)).AllClaimed).Select(x =>
                     {
                         var campaign = _campaigns.First(c => c.Id == x.Key);
                         return new DropCampaign
@@ -171,7 +262,7 @@ internal sealed class DemoAccount : IAccount
                                 Self = new TimeBasedDropSelfEdge
                                 {
                                     CurrentMinutesWatched = Math.Min(x.Value[i], drop.RequiredMinutesWatched),
-                                    IsClaimed = x.Value[i] >= drop.RequiredMinutesWatched
+                                    IsClaimed = x.Value[i] >= drop.RequiredMinutesWatched && !_unclaimed.Contains(x.Key)
                                 }
                             }).ToList()
                         };
@@ -370,6 +461,8 @@ internal sealed class DemoSetup
     public int WaitSeconds { get; set; } = 220;
     public HashSet<string> Linked { get; } = new();
     public HashSet<string> Offline { get; } = new();
+    public HashSet<string> Unclaimed { get; } = new();
+    public List<(string CampaignId, int MinutesAgo)> Checked { get; } = new();
     public List<string> Queue { get; } = new();
     public Dictionary<string, int[]> Progress { get; } = new();
     public List<(string CampaignId, CampaignNoteKind Kind, int MinutesAgo)> Notes { get; } = new();
@@ -450,6 +543,12 @@ internal static class DemoCatalogue
         setup.Notes.Add(("valorant-vct", CampaignNoteKind.NoLiveChannel, 3));
         setup.Notes.Add(("eve-weekly", CampaignNoteKind.NoLiveChannel, 4));
         setup.Notes.Add(("payday3-masks", CampaignNoteKind.Completed, 70));
+        setup.Progress["eve-weekly"] = new[] { 60 };
+        setup.Unclaimed.Add("eve-weekly");
+        setup.Checked.Add(("payday3-masks", 12));
+        setup.Checked.Add(("lol-worlds", 9));
+        setup.Checked.Add(("aniimo-beta", 15));
+        setup.Progress["aniimo-beta"] = new[] { 60, 120 };
         setup.Notes.Add(("genshin-61", CampaignNoteKind.NotEnoughTime, 70));
         setup.Log.AddRange(new (LogEventLevel, string)[]
         {
@@ -486,7 +585,9 @@ internal static class DemoCatalogue
         setup.Notes.Add(("r6s-invitational", CampaignNoteKind.Completed, 300));
         setup.Notes.Add(("payday3-masks", CampaignNoteKind.Completed, 300));
         setup.Notes.Add(("rematch-launch", CampaignNoteKind.Completed, 260));
-        setup.Notes.Add(("smite2-weekly", CampaignNoteKind.NoWatchableDrops, 2));
+        setup.Progress["hs-masters"] = new[] { 60, 60 };
+        setup.Unclaimed.Add("hs-masters");
+        setup.Checked.Add(("rematch-launch", 20));
         setup.Log.AddRange(new (LogEventLevel, string)[]
         {
             (LogEventLevel.Information, "Removing 4 finished campaigns..."),

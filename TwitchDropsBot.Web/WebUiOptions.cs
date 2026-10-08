@@ -3,8 +3,8 @@ using System.Net;
 namespace TwitchDropsBot.Web;
 
 /// <summary>
-/// Web UI settings, read from environment variables so config.json stays untouched:
-/// WEBUI_PORT (enables the UI), WEBUI_PASSWORD or WEBUI_PASSWORD_FILE, WEBUI_AUTH=none,
+/// Web UI settings, read from environment variables so config.json stays untouched: WEBUI_ENABLED=true
+/// (off by default), WEBUI_PORT (8080), WEBUI_PASSWORD or WEBUI_PASSWORD_FILE, WEBUI_AUTH=none,
 /// WEBUI_TRUSTED_PROXIES (comma-separated addresses), WEBUI_DATA_DIR and WEBUI_DEMO=true.
 /// </summary>
 public sealed class WebUiOptions
@@ -22,13 +22,15 @@ public sealed class WebUiOptions
     {
         error = null;
 
-        var portText = Environment.GetEnvironmentVariable("WEBUI_PORT");
-        if (string.IsNullOrWhiteSpace(portText))
+        var demo = IsTrue("WEBUI_DEMO");
+        if (!IsTrue("WEBUI_ENABLED") && !demo)
         {
             return null;
         }
 
-        if (!int.TryParse(portText, out var port) || port is < 1 or > 65535)
+        var port = 8080;
+        var portText = Environment.GetEnvironmentVariable("WEBUI_PORT");
+        if (!string.IsNullOrWhiteSpace(portText) && (!int.TryParse(portText, out port) || port is < 1 or > 65535))
         {
             error = $"WEBUI_PORT '{portText}' is not a valid port.";
             return null;
@@ -76,10 +78,12 @@ public sealed class WebUiOptions
             Port = port,
             Password = string.IsNullOrEmpty(password) ? null : password,
             AuthDisabled = authDisabled,
-            Demo = string.Equals(Environment.GetEnvironmentVariable("WEBUI_DEMO"), "true",
-                StringComparison.OrdinalIgnoreCase),
+            Demo = demo,
             TrustedProxies = proxies,
             DataDirectory = dataDirectory
         };
     }
+
+    private static bool IsTrue(string name) =>
+        Environment.GetEnvironmentVariable(name)?.Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
 }

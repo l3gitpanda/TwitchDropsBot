@@ -62,12 +62,14 @@ public sealed class WebUiHost
             return null;
         }
 
+        var loggerFactory = botServices.GetRequiredService<ILoggerFactory>();
         IAccountSource accounts = options.Demo
-            ? new DemoAccountSource(botServices.GetRequiredService<ILoggerFactory>())
+            ? new DemoAccountSource(loggerFactory)
             : new LiveAccountSource(
                 botServices.GetRequiredService<BotRegistry>(),
                 botServices.GetRequiredService<CampaignQueueService>(),
-                botServices.GetRequiredService<IOptionsMonitor<BotSettings>>());
+                botServices.GetRequiredService<IOptionsMonitor<BotSettings>>(),
+                new CampaignStatusStore(dataDirectory, loggerFactory.CreateLogger<CampaignStatusStore>()));
 
         return new WebUiHost(options, accounts, logger);
     }
@@ -78,8 +80,16 @@ public sealed class WebUiHost
         try
         {
             var app = Build();
-            _logger.LogInformation("Web UI listening on port {Port}{Mode}", _options.Port,
-                _options.Demo ? " (demo data)" : _options.RequiresLogin ? "" : " (no login)");
+            _logger.LogInformation("Web UI listening on port {Port}", _options.Port);
+            if (_options.Demo)
+            {
+                _logger.LogInformation("Web UI is serving demo data");
+            }
+            else if (!_options.RequiresLogin)
+            {
+                _logger.LogWarning("Web UI runs without a login (WEBUI_AUTH=none)");
+            }
+
             await app.RunAsync(cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -106,6 +116,8 @@ public sealed class WebUiHost
         // Keys sit unencrypted beside config.json, which already holds the tokens; nothing to act on
         builder.Logging.AddFilter<SerilogLoggerProvider>("Microsoft.AspNetCore.DataProtection", LogLevel.Error);
 
+        // The aspnet base image sets ASPNETCORE_HTTP_PORTS; the port here is WEBUI_PORT
+        builder.WebHost.UseSetting(WebHostDefaults.HttpPortsKey, string.Empty);
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
             kestrel.ListenAnyIP(_options.Port);
@@ -131,6 +143,7 @@ public sealed class WebUiHost
         builder.Services.AddSingleton<LoginThrottle>();
         builder.Services.AddSingleton<StateBroadcaster>();
         builder.Services.AddHostedService(x => x.GetRequiredService<StateBroadcaster>());
+        builder.Services.AddHostedService<StatusScanner>();
 
         // Keys for the login cookie live beside config.json, so a restart doesn't log the phone out
         builder.Services.AddDataProtection()

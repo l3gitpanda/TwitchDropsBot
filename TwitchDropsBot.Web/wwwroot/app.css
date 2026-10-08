@@ -535,6 +535,7 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 @keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
 
 .muted { color: var(--text-3); }
+.small { font-size: 13px; }
 .num { font-variant-numeric: tabular-nums; }
 
 /* ---------- now ---------- */
@@ -951,6 +952,7 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
   .col-right { position: sticky; top: 76px; }
   .col-right .view { display: none; }
   .col-right .view.right-active { display: block; }
+  .chips { flex-wrap: wrap; overflow-x: visible; }
   .panel-switch {
     display: inline-flex;
     gap: 4px;

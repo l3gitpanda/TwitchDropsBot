@@ -24,7 +24,9 @@ const FILTERS = [
   ['favourites', 'Favourites'],
   ['queued', 'Queued'],
   ['progress', 'In progress'],
-  ['linked', 'Linked'],
+  ['unclaimed', 'Unclaimed'],
+  ['done', 'Done'],
+  ['linked', 'Linked / no link'],
   ['ending', 'Ending soon'],
 ];
 
@@ -550,8 +552,8 @@ function tierList(tiers, { all = false, sheet = false } = {}) {
     ${shown.map((t) => html`<li class="tier ${t.claimed ? 'claimed' : t.active ? 'active' : ''}">
       <span class="tier-mark">${t.claimed ? icon('check-circle', 'sm') : t.active ? raw('<span class="now"></span>') : raw('<span class="ring"></span>')}</span>
       <span class="tier-name">${t.name}</span>
-      <span class="tier-num num">${t.claimed ? 'claimed' : `${Math.min(t.current, t.required)} / ${t.required} min`}</span>
-      ${meter(t.current, t.required, 'sm')}
+      <span class="tier-num num">${t.claimed ? 'claimed' : t.current == null ? `${minutesText(t.required)}` : `${Math.min(t.current, t.required)} / ${t.required} min`}</span>
+      ${t.current == null && !t.claimed ? '' : meter(t.claimed ? t.required : t.current, t.required, 'sm')}
     </li>`)}
     ${hidden > 0 ? html`<li class="tier-more">+${hidden} more ${hidden === 1 ? 'drop' : 'drops'} later in this campaign</li>` : ''}
   </ol>`;
@@ -582,6 +584,9 @@ function queueState(account, item, index) {
   switch (item.state) {
     case 'watching': return { cls: 'good', glyph: 'radio', text: 'Watching now' };
     case 'done': return { cls: 'good', glyph: 'check-circle', text: 'Done, all drops earned' };
+    case 'waitingClaim': return item.needsLink
+      ? { cls: 'bad', glyph: 'link', text: 'Watched · link your account to claim' }
+      : { cls: 'busy', glyph: 'clock', text: 'Watched · claim pending' };
     case 'ended': return { cls: 'bad', glyph: 'clock', text: 'Campaign ended' };
     case 'unavailable': return { cls: 'bad', glyph: 'alert', text: 'No longer offered to this account' };
     default:
@@ -605,7 +610,7 @@ function queueRow(account, item, index, editable) {
         <div class="row-title">${item.campaignName || 'Unknown campaign'}</div>
         <div class="row-sub">${item.gameName || 'Unknown game'} · ${item.endsAt ? live('ends', item.endsAt, endsText(item.endsAt)) : 'no end date'}</div>
         <div class="row-state ${state.cls}">${icon(state.glyph)}<span>${state.text}</span></div>
-        ${p && p.total ? html`${meter(p.watched, p.required, 'sm')}<div class="row-progress"><span>${p.claimed} of ${p.total} drops</span><span class="num">${p.watched}/${p.required} min</span></div>` : ''}
+        ${p && p.total && item.state !== 'done' ? html`${meter(p.watched, p.required, 'sm')}<div class="row-progress"><span>${p.claimed} of ${p.total} ${dropsWord(p.total)}</span><span class="num">${p.watched}/${p.required} min</span></div>` : ''}
       </div>
     </button>
     ${editable ? html`<div class="row-side"><button class="btn ghost square sm" data-menu="queue" data-id="${item.campaignId}" aria-label="Actions for ${item.campaignName}">${icon('more')}</button></div>` : ''}
@@ -804,7 +809,7 @@ async function ensureCampaigns(force = false) {
   const account = currentAccount();
   if (!account) return;
   const cached = store.campaigns.get(account.id);
-  const stale = !cached || !cached.campaigns || cached.updatedAt !== account.campaignsUpdatedAt;
+  const stale = !cached || !cached.campaigns || cached.version !== account.campaignsVersion;
   if (cached?.loading || (!force && !stale && !cached?.error)) return;
 
   store.campaigns.set(account.id, { ...cached, loading: true, error: null });
@@ -830,7 +835,9 @@ function filterCampaigns(account, list) {
     all: () => true,
     favourites: (c) => c.isFavourite,
     queued: (c) => queuePosition(account, c.id),
-    progress: (c) => c.progress && c.progress.claimed < c.progress.total,
+    progress: (c) => c.status === 'inProgress' || c.isWatching,
+    unclaimed: (c) => c.status === 'waitingClaim',
+    done: (c) => c.status === 'done',
     linked: (c) => c.link !== 'unlinked',
     ending: (c) => c.endsAt && new Date(c.endsAt) < soon,
   };
@@ -857,7 +864,7 @@ function renderCampaignList(force = false) {
   if (!host || !account) return;
 
   const cached = store.campaigns.get(account.id);
-  const key = JSON.stringify([account.id, account.queue.map((q) => q.campaignId), account.watching?.campaignId, account.onlyFavourites, cached?.updatedAt, cached?.loading, cached?.error, store.filter, store.sort, store.search]);
+  const key = JSON.stringify([account.id, account.queue.map((q) => q.campaignId), account.watching?.campaignId, account.onlyFavourites, cached?.version, cached?.loading, cached?.error, store.filter, store.sort, store.search]);
   if (!force && key === lastListKey) return;
   lastListKey = key;
 
@@ -913,11 +920,31 @@ function campaignBadges(account, c) {
     ${c.isAvoided ? html`<span class="badge muted">Avoided</span>` : ''}`;
 }
 
+function dropsWord(n) {
+  return n === 1 ? 'drop' : 'drops';
+}
+
+// Where a campaign stands: done, watched but unclaimed, in progress, not started, or not known yet
+function campaignStatus(c) {
+  const p = c.progress;
+  switch (p || c.status === 'done' ? c.status : 'unknown') {
+    case 'done':
+      return html`<div class="row-state good">${icon('check-circle')}<span>All drops earned</span></div>`;
+    case 'waitingClaim':
+      return html`<div class="row-state ${c.needsLink ? 'bad' : 'busy'}">${icon(c.needsLink ? 'link' : 'clock')}<span>${p.waiting} ${dropsWord(p.waiting)} watched · ${c.needsLink ? 'link your account to claim' : 'claim pending'}</span></div>`;
+    case 'inProgress':
+      return html`${meter(p.watched, p.required, 'sm')}<div class="row-progress"><span>${p.claimed} of ${p.total} ${dropsWord(p.total)}</span><span class="num">${p.watched}/${p.required} min</span></div>`;
+    case 'notStarted':
+      return html`<div class="row-progress"><span>Not started · first drop after ${minutesText(p.required)}</span></div>`;
+    default:
+      return c.totalMinutes ? html`<div class="row-progress"><span>All drops in ${minutesText(c.totalMinutes)}</span></div>` : '';
+  }
+}
+
 function campaignRow(account, c) {
   const position = queuePosition(account, c.id);
   const watching = account.watching?.campaignId === c.id;
-  const p = c.progress;
-  const done = p && p.total && p.claimed >= p.total;
+  const done = c.status === 'done';
   return html`<li class="row clickable">
     <button class="row-open" data-open="${c.id}" aria-label="${c.name}, details">
       ${art(c.boxArtUrl, c.gameName)}
@@ -925,8 +952,7 @@ function campaignRow(account, c) {
         <div class="row-title">${c.name}</div>
         <div class="row-sub">${c.gameName || 'Unknown game'} · ${c.endsAt ? live('ends', c.endsAt, endsText(c.endsAt)) : 'no end date'}</div>
         <div class="badges">${campaignBadges(account, c)}</div>
-        ${p && p.total ? html`${meter(done ? 1 : p.watched, done ? 1 : p.required, 'sm')}<div class="row-progress"><span>${done ? 'All drops earned' : `${p.claimed} of ${p.total} drops`}</span><span class="num">${done ? '' : `${p.watched}/${p.required} min`}</span></div>`
-          : c.totalMinutes ? html`<div class="row-progress"><span>All drops in ${minutesText(c.totalMinutes)}</span></div>` : ''}
+        ${campaignStatus(c)}
       </div>
     </button>
     <div class="row-side">
@@ -940,8 +966,9 @@ function campaignRow(account, c) {
 
 const sheet = $('#sheet');
 
-async function openCampaign(campaignId, accountId = store.accountId) {
-  store.sheet = { accountId, campaignId, detail: null, loading: true, error: null, also: false };
+async function openCampaign(campaignId, accountId = store.accountId, { recheck = false } = {}) {
+  const keep = recheck && store.sheet?.campaignId === campaignId ? store.sheet : null;
+  store.sheet = { accountId, campaignId, detail: keep?.detail ?? null, loading: true, checking: recheck, error: null, also: keep?.also ?? false };
   renderSheet();
   if (!sheet.open) {
     sheet.showModal();
@@ -949,13 +976,14 @@ async function openCampaign(campaignId, accountId = store.accountId) {
   }
 
   try {
-    const detail = await api(`/api/accounts/${enc(accountId)}/campaigns/${enc(campaignId)}`);
+    const detail = await api(`/api/accounts/${enc(accountId)}/campaigns/${enc(campaignId)}${recheck ? '?recheck=true' : ''}`);
     if (store.sheet?.campaignId === campaignId) store.sheet.detail = detail;
   } catch (e) {
     if (store.sheet?.campaignId === campaignId) store.sheet.error = e.message;
   }
   if (store.sheet?.campaignId === campaignId) {
     store.sheet.loading = false;
+    store.sheet.checking = false;
     renderSheet();
   }
 }
@@ -990,6 +1018,7 @@ function renderSheet() {
   const position = queuePosition(account, c.id);
   const watching = account.watching?.campaignId === c.id;
   const canQueue = s.detail ? s.detail.canQueue : c.kind !== 'reward';
+  const finished = c.status === 'done' && !watching;
   const others = accounts().filter((a) => a.id !== account.id);
   const tiers = s.detail?.tiers;
   const note = (queued?.note ?? c.note);
@@ -999,9 +1028,30 @@ function renderSheet() {
   else if (position) status = html`<div class="callout info">${icon('queue', 'sm')}<div class="grow"><strong>#${position} in ${account.login}'s queue.</strong> ${position === 1 ? 'It goes next, as soon as it can be watched.' : `${position - 1} ahead of it.`}</div></div>`;
   else status = '';
 
-  const noteLine = note && !watching
-    ? html`<div class="callout ${note.kind === 'Completed' ? 'good' : 'warn'}">${icon(note.kind === 'Completed' ? 'check-circle' : 'alert', 'sm')}<div class="grow"><strong>${NOTE_TEXT[note.kind] || 'Skipped'}</strong> · last checked ${live('ago', note.at, agoText(note.at))}</div></div>`
+  const noteLine = note && !watching && note.kind !== 'Completed' && c.status !== 'done'
+    ? html`<div class="callout warn">${icon('alert', 'sm')}<div class="grow"><strong>${NOTE_TEXT[note.kind] || 'Skipped'}</strong> · last checked ${live('ago', note.at, agoText(note.at))}</div></div>`
     : '';
+  const p = c.progress;
+  const checkedOn = c.statusCheckedAt && c.statusSource === 'channel'
+    ? html` · checked ${live('ago', c.statusCheckedAt, agoText(c.statusCheckedAt))}${s.detail?.statusChannel ? html` on ${s.detail.statusChannel}` : ''}`
+    : '';
+  const recheck = html`<button class="link-btn" data-action="sheet-recheck" ${raw(s.checking ? 'disabled' : '')}>${s.checking ? 'Checking…' : 'Check again'}</button>`;
+  let progressLine = '';
+  if (!watching && c.kind === 'drop') {
+    if (c.status === 'done') {
+      progressLine = html`<div class="callout good">${icon('check-circle', 'sm')}<div class="grow"><strong>All drops earned</strong>${checkedOn}</div></div>`;
+    } else if (c.status === 'waitingClaim' && p) {
+      progressLine = c.needsLink
+        ? html`<div class="callout bad">${icon('link', 'sm')}<div class="grow"><strong>${p.waiting} ${dropsWord(p.waiting)} watched but not claimed.</strong> Twitch hands ${p.waiting === 1 ? 'it' : 'them'} over once ${account.login} links the game account.${checkedOn}</div></div>`
+        : html`<div class="callout info">${icon('clock', 'sm')}<div class="grow"><strong>${p.waiting} ${dropsWord(p.waiting)} watched.</strong> The bot claims ${p.waiting === 1 ? 'it' : 'them'} at its next check.</div></div>`;
+    } else if (c.status === 'unknown' && !s.loading) {
+      // The bot's own note usually gives the same reason, so the check's reason only shows without one
+      const problem = !noteLine && s.detail?.statusProblem ? `${s.detail.statusProblem}. ` : '';
+      progressLine = html`<div class="callout">${icon('info', 'sm')}<div class="grow"><strong>Progress not known yet.</strong> ${problem}${recheck}</div></div>`;
+    } else if (c.statusSource === 'channel') {
+      progressLine = html`<p class="muted small">Progress${checkedOn}. ${recheck}</p>`;
+    }
+  }
 
   const linkUrl = safeUrl(c.linkUrl);
   const detailsUrl = safeUrl(s.detail?.detailsUrl);
@@ -1019,8 +1069,10 @@ function renderSheet() {
     </header>
     <div class="sheet-body">
       ${status}
+      ${progressLine}
       ${noteLine}
-      ${c.link === 'unlinked' ? html`<div class="callout warn">${icon('link', 'sm')}<div class="grow"><strong>${account.login} isn't linked to this game.</strong> Watching still counts, and Twitch hands the drops over once the account is linked.${linkUrl ? html` <a href="${linkUrl}" target="_blank" rel="noopener noreferrer">Link the account</a>` : ''}</div></div>` : ''}
+      ${c.link === 'unlinked' && c.status !== 'waitingClaim' ? html`<div class="callout warn">${icon('link', 'sm')}<div class="grow"><strong>${account.login} isn't linked to this game.</strong> Watching still counts, and Twitch hands the drops over once the account is linked.${linkUrl ? html` <a href="${linkUrl}" target="_blank" rel="noopener noreferrer">Link the account</a>` : ''}</div></div>` : ''}
+      ${c.link === 'unlinked' && c.status === 'waitingClaim' && linkUrl ? html`<div class="sheet-links"><a class="btn sm" href="${linkUrl}" target="_blank" rel="noopener noreferrer">${icon('link', 'sm')}Link the account</a></div>` : ''}
       ${!c.isFavourite && account.onlyFavourites && c.kind !== 'reward' ? html`<div class="callout info">${icon('star', 'sm')}<div class="grow">Not in the favourites list, so the bot only farms it while it's queued.</div></div>` : ''}
       <h4>Drops${c.totalMinutes ? html` · all in ${minutesText(c.totalMinutes)}` : ''}</h4>
       ${s.loading && !tiers ? html`<div class="skeleton" data-skeleton></div>` : ''}
@@ -1030,14 +1082,15 @@ function renderSheet() {
       ${detailsUrl ? html`<div class="sheet-links"><a class="btn ghost sm" href="${detailsUrl}" target="_blank" rel="noopener noreferrer">${icon('external', 'sm')}Open on Twitch</a></div>` : ''}
     </div>
     <footer class="sheet-actions">
-      ${canQueue && others.length && !position ? html`<label class="also"><input type="checkbox" id="also-others" ${raw(s.also ? 'checked' : '')}> Also for ${others.map((a) => a.login).join(', ')}</label>` : ''}
-      ${canQueue ? html`<div class="row-buttons">
+      ${canQueue && !finished && others.length && !position ? html`<label class="also"><input type="checkbox" id="also-others" ${raw(s.also ? 'checked' : '')}> Also for ${others.map((a) => a.login).join(', ')}</label>` : ''}
+      ${finished && !position ? html`<p class="reason">Every drop is claimed, so there's nothing left to watch.</p>`
+        : canQueue ? html`<div class="row-buttons">
         ${position
           ? html`<button class="btn danger" data-action="sheet-remove">${icon('x', 'sm')}Remove</button>
                  ${position > 1 ? html`<button class="btn" data-action="sheet-top">${icon('top', 'sm')}Move to top</button>` : ''}`
           : html`<button class="btn" data-action="sheet-add">${icon('plus', 'sm')}Add to queue</button>
                  <button class="btn" data-action="sheet-next">${icon('top', 'sm')}Watch next</button>`}
-        ${watching ? '' : html`<button class="btn primary" data-action="sheet-now">${icon('play', 'sm solid')}Watch now</button>`}
+        ${watching || finished ? '' : html`<button class="btn primary" data-action="sheet-now">${icon('play', 'sm solid')}Watch now</button>`}
       </div>` : html`<p class="reason">${s.detail?.cannotQueueReason || 'This campaign can\'t be queued.'}</p>`}
     </footer>`);
 
@@ -1191,7 +1244,8 @@ function appMenu(anchor) {
     localStorage.setItem(KEY.theme, value);
     applyTheme(value);
   };
-  const version = (store.state?.version || store.session?.version || '').split('+')[0];
+  const raw_version = (store.state?.version || store.session?.version || '').split('+')[0];
+  const version = raw_version.startsWith('0.0.0') ? '' : raw_version;
   openMenu(anchor, [
     { icon: 'refresh', label: 'Refresh campaign list', run: () => ensureCampaigns(true) },
     'sep',
@@ -1200,7 +1254,7 @@ function appMenu(anchor) {
     { icon: 'moon', label: 'Dark', checked: theme === 'dark', run: setTheme('dark') },
     { icon: 'sun', label: 'Light', checked: theme === 'light', run: setTheme('light') },
     ...(store.session?.loginRequired ? ['sep', { icon: 'logout', label: 'Sign out', danger: true, run: signOut }] : []),
-    { foot: `TwitchDropsBot ${version}${store.state?.demo ? ' · demo data' : ''}` },
+    { foot: `TwitchDropsBot${version ? ` ${version}` : ''}${store.state?.demo ? ' · demo data' : ''}` },
   ]);
 }
 
@@ -1278,6 +1332,7 @@ document.addEventListener('click', async (event) => {
       return;
     }
     case 'sheet-remove': return removeFromQueue(store.sheet.accountId, store.sheet.campaignId);
+    case 'sheet-recheck': return openCampaign(store.sheet.campaignId, store.sheet.accountId, { recheck: true });
     case 'sheet-top': return moveInQueue(accountById(store.sheet.accountId), store.sheet.campaignId, 0, 0);
     default:
   }
