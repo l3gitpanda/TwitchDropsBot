@@ -6,6 +6,7 @@ using TwitchDropsBot.Core.Platform.Shared.Services;
 using TwitchDropsBot.Core.Platform.Twitch.Bot;
 using TwitchDropsBot.Core.Platform.Twitch.Models;
 using TwitchDropsBot.Core.Platform.Twitch.Models.Abstractions;
+using TwitchDropsBot.Web.Games;
 
 namespace TwitchDropsBot.Web.Accounts;
 
@@ -31,6 +32,9 @@ public sealed class DemoAccountSource : IAccountSource, IDisposable
             Priority.Add(game);
         }
 
+        Favourites = new DemoFavouriteGames(DemoCatalogue.Favourites);
+        GameLookup = new OfflineGameLookup();
+
         var statusDirectory = Directory.CreateTempSubdirectory("tdb-demo-status").FullName;
         Store = new CampaignStatusStore(statusDirectory, loggerFactory.CreateLogger<CampaignStatusStore>());
 
@@ -38,8 +42,10 @@ public sealed class DemoAccountSource : IAccountSource, IDisposable
         var upcoming = DemoCatalogue.BuildUpcoming();
         _accounts = new List<DemoAccount>
         {
-            new("100000001", "ana_demo", catalogue, upcoming, Queue, Priority, Store, DemoCatalogue.FirstAccountSetup),
-            new("100000002", "ben_demo", catalogue, upcoming, Queue, Priority, Store, DemoCatalogue.SecondAccountSetup)
+            new("100000001", "ana_demo", catalogue, upcoming, Queue, Priority, Favourites, Store,
+                DemoCatalogue.FirstAccountSetup),
+            new("100000002", "ben_demo", catalogue, upcoming, Queue, Priority, Favourites, Store,
+                DemoCatalogue.SecondAccountSetup)
         };
 
         _timer = new Timer(_ => Step(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
@@ -48,6 +54,10 @@ public sealed class DemoAccountSource : IAccountSource, IDisposable
     public CampaignQueueService Queue { get; }
 
     public PriorityGamesService Priority { get; }
+
+    public IFavouriteGames Favourites { get; }
+
+    public IGameLookup GameLookup { get; }
 
     public CampaignStatusStore Store { get; }
 
@@ -69,6 +79,7 @@ internal sealed class DemoAccount : IAccount
     private readonly object _lock = new();
     private readonly CampaignQueueService _queue;
     private readonly PriorityGamesService _priority;
+    private readonly IFavouriteGames _favourites;
     private readonly List<AbstractCampaign> _campaigns;
     private readonly List<AbstractCampaign> _upcoming;
     private readonly Dictionary<string, CampaignNote> _notes = new();
@@ -85,12 +96,14 @@ internal sealed class DemoAccount : IAccount
     private DateTime _phaseUntil;
 
     public DemoAccount(string id, string login, List<AbstractCampaign> catalogue, List<AbstractCampaign> upcoming,
-        CampaignQueueService queue, PriorityGamesService priority, CampaignStatusStore store, Action<DemoSetup> setup)
+        CampaignQueueService queue, PriorityGamesService priority, IFavouriteGames favourites, CampaignStatusStore store,
+        Action<DemoSetup> setup)
     {
         Id = id;
         Login = login;
         _queue = queue;
         _priority = priority;
+        _favourites = favourites;
         _store = store;
 
         var options = new DemoSetup();
@@ -101,7 +114,6 @@ internal sealed class DemoAccount : IAccount
         _unclaimed = options.Unclaimed;
         _campaigns = catalogue.Select(x => DemoCatalogue.ForAccount(x, _linked)).ToList();
         _upcoming = upcoming.Select(x => DemoCatalogue.ForAccount(x, _linked)).ToList();
-        FavouriteGames = DemoCatalogue.Favourites;
 
         foreach (var (campaignId, minutes) in options.Progress)
         {
@@ -239,7 +251,7 @@ internal sealed class DemoAccount : IAccount
     public IReadOnlyList<AbstractCampaign> Campaigns => _campaigns;
     public IReadOnlyList<AbstractCampaign> UpcomingCampaigns => _upcoming;
     public DateTime? CampaignsAt { get; private set; }
-    public IReadOnlyList<string> FavouriteGames { get; }
+    public IReadOnlyList<string> FavouriteGames => _favourites.Games;
     public bool OnlyFavouriteGames => true;
     public IReadOnlyList<string> AvoidedCampaigns { get; } = Array.Empty<string>();
 

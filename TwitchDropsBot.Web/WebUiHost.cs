@@ -17,8 +17,10 @@ using Serilog;
 using Serilog.Extensions.Logging;
 using TwitchDropsBot.Core;
 using TwitchDropsBot.Core.Platform.Shared.Services;
+using TwitchDropsBot.Core.Platform.Shared.Helpers;
 using TwitchDropsBot.Core.Platform.Shared.Settings;
 using TwitchDropsBot.Web.Accounts;
+using TwitchDropsBot.Web.Games;
 using TwitchDropsBot.Web.Api;
 using ILogger = Microsoft.Extensions.Logging.ILogger;
 
@@ -63,13 +65,16 @@ public sealed class WebUiHost
         }
 
         var loggerFactory = botServices.GetRequiredService<ILoggerFactory>();
+        var settings = botServices.GetRequiredService<IOptionsMonitor<BotSettings>>();
         IAccountSource accounts = options.Demo
             ? new DemoAccountSource(loggerFactory)
             : new LiveAccountSource(
                 botServices.GetRequiredService<BotRegistry>(),
                 botServices.GetRequiredService<CampaignQueueService>(),
                 botServices.GetRequiredService<PriorityGamesService>(),
-                botServices.GetRequiredService<IOptionsMonitor<BotSettings>>(),
+                new ConfigFavouriteGames(settings, ConfigPathHelper.GetConfigFilePath("config.json"), logger),
+                new TwitchGameLookup(),
+                settings,
                 new CampaignStatusStore(dataDirectory, loggerFactory.CreateLogger<CampaignStatusStore>()));
 
         return new WebUiHost(options, accounts, logger);

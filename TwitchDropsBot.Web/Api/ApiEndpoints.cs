@@ -121,12 +121,21 @@ public static class ApiEndpoints
             }
         });
 
-        secured.MapPost("/priority-games", (PriorityGameRequest request, WebBackend backend) =>
-            ToResult(backend.AddPriorityGame(request)));
+        secured.MapPost("/priority-games", async (PriorityGameRequest request, WebBackend backend,
+                CancellationToken cancellationToken) =>
+            ToResult(await backend.AddPriorityGameAsync(request, cancellationToken)));
 
         // By query, since a game name can hold a slash
         secured.MapDelete("/priority-games", (string? name, WebBackend backend) =>
             ToResult(backend.RemovePriorityGame(name)));
+
+        // Edits FavouriteGames in config.json; nothing else in the file changes
+        secured.MapPost("/favourite-games", async (FavouriteGameRequest request, WebBackend backend,
+                CancellationToken cancellationToken) =>
+            ToResult(await backend.AddFavouriteGameAsync(request, cancellationToken)));
+
+        secured.MapDelete("/favourite-games", (string? name, WebBackend backend) =>
+            ToResult(backend.RemoveFavouriteGame(name)));
 
         var account = secured.MapGroup("/accounts/{accountId}");
 

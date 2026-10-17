@@ -7,6 +7,7 @@ using TwitchDropsBot.Core.Platform.Twitch.Bot;
 using TwitchDropsBot.Core.Platform.Twitch.Models;
 using TwitchDropsBot.Core.Platform.Twitch.Models.Abstractions;
 using TwitchDropsBot.Core.Platform.Twitch.Models.Extensions;
+using TwitchDropsBot.Web.Games;
 
 namespace TwitchDropsBot.Web.Accounts;
 
@@ -314,13 +315,16 @@ public sealed class LiveAccountSource : IAccountSource
     private readonly ConcurrentDictionary<TwitchUser, LiveAccount> _accounts = new();
 
     public LiveAccountSource(BotRegistry registry, CampaignQueueService queue, PriorityGamesService priority,
-        IOptionsMonitor<BotSettings> settings, CampaignStatusStore store)
+        IFavouriteGames favourites, IGameLookup gameLookup, IOptionsMonitor<BotSettings> settings,
+        CampaignStatusStore store)
     {
         _registry = registry;
         _settings = settings;
         _store = store;
         Queue = queue;
         Priority = priority;
+        Favourites = favourites;
+        GameLookup = gameLookup;
 
         // Subscribe before reading the list, so no account's early log lines are missed
         _registry.UserRegistered += user =>
@@ -340,6 +344,10 @@ public sealed class LiveAccountSource : IAccountSource
     public CampaignQueueService Queue { get; }
 
     public PriorityGamesService Priority { get; }
+
+    public IFavouriteGames Favourites { get; }
+
+    public IGameLookup GameLookup { get; }
 
     public CampaignStatusStore Store => _store;
 

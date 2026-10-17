@@ -60,14 +60,14 @@ public sealed partial class WebBackend
     public StateDto GetState()
     {
         return new StateDto(Version, IsDemo, _source.Accounts.Select(BuildAccount).ToList(), BuildPriorityGames(),
-            GameNames());
+            _source.Favourites.Games, _source.Favourites.AccountsWithOwnList, GameNames());
     }
 
-    // Exact Twitch names the page can suggest for a priority game: favourites and every listed campaign's game
+    // Exact Twitch names the page can suggest: favourites and every listed campaign's game
     private List<string> GameNames() =>
-        _source.Accounts
-            .SelectMany(x => x.FavouriteGames.Concat(
-                x.Campaigns.Concat(x.UpcomingCampaigns).Select(GameName).OfType<string>()))
+        _source.Favourites.Games
+            .Concat(_source.Accounts.SelectMany(x => x.FavouriteGames.Concat(
+                x.Campaigns.Concat(x.UpcomingCampaigns).Select(GameName).OfType<string>())))
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Order(StringComparer.OrdinalIgnoreCase)
@@ -265,16 +265,19 @@ public sealed partial class WebBackend
     }
 
     /// <summary>Makes a game a priority game for every account; a bot between cycles looks again at once.</summary>
-    public BackendResult AddPriorityGame(PriorityGameRequest request)
+    public async Task<BackendResult> AddPriorityGameAsync(PriorityGameRequest request,
+        CancellationToken cancellationToken)
     {
-        // Spelled as Twitch spells it when the bot knows the game, so the list reads like the campaigns do
-        var name = request.Name?.Trim();
-        var known = GameNames().FirstOrDefault(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase));
+        var game = await ResolveGameAsync(request.Name, cancellationToken);
+        if (game.Error is not null)
+        {
+            return BackendResult.BadRequest(game.Error);
+        }
 
         bool added;
         try
         {
-            added = _source.Priority.Add(known ?? name);
+            added = _source.Priority.Add(game.Name);
         }
         catch (ArgumentException e)
         {
@@ -284,13 +287,114 @@ public sealed partial class WebBackend
         // A watching bot looks at its next minute, told by the priority list itself
         if (added)
         {
-            foreach (var account in _source.Accounts.Where(IsWaiting))
-            {
-                account.RequestReselect();
-            }
+            WakeWaiting();
         }
 
-        return BackendResult.Ok(BuildPriorityGames());
+        return BackendResult.Ok(new PriorityChangeDto(BuildPriorityGames(), game.Name, game.Note));
+    }
+
+    /// <summary>
+    /// Adds a game to FavouriteGames in config.json. The bots read the list at their next pick; one between
+    /// cycles looks again at once.
+    /// </summary>
+    public async Task<BackendResult> AddFavouriteGameAsync(FavouriteGameRequest request,
+        CancellationToken cancellationToken)
+    {
+        var game = await ResolveGameAsync(request.Name, cancellationToken);
+        if (game.Error is not null)
+        {
+            return BackendResult.BadRequest(game.Error);
+        }
+
+        var before = _source.Favourites.Games.Count;
+        IReadOnlyList<string> games;
+        try
+        {
+            games = _source.Favourites.Add(game.Name!);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            return BackendResult.Conflict($"config.json wasn't changed: {e.Message}");
+        }
+
+        var added = games.Count > before;
+        if (added)
+        {
+            WakeWaiting();
+        }
+
+        Changed?.Invoke();
+        return BackendResult.Ok(new FavouriteChangeDto(games, game.Name, added, game.Note));
+    }
+
+    public BackendResult RemoveFavouriteGame(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return BackendResult.NotFound("That game isn't a favourite.");
+        }
+
+        IReadOnlyList<string> games;
+        try
+        {
+            games = _source.Favourites.Remove(name.Trim());
+        }
+        catch (KeyNotFoundException)
+        {
+            return BackendResult.NotFound("That game isn't a favourite.");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            return BackendResult.Conflict($"config.json wasn't changed: {e.Message}");
+        }
+
+        Changed?.Invoke();
+        return BackendResult.Ok(new FavouriteChangeDto(games, name.Trim(), false, null));
+    }
+
+    private void WakeWaiting()
+    {
+        foreach (var account in _source.Accounts.Where(IsWaiting))
+        {
+            account.RequestReselect();
+        }
+    }
+
+    /// <summary>
+    /// A typed game name as Twitch spells it: a game the bot already knows, else Twitch's own answer. A name
+    /// Twitch doesn't know is refused, since favourites and priority games match categories by name and a
+    /// misspelling would silently match nothing. If Twitch can't be asked, the name is taken as typed.
+    /// </summary>
+    private async Task<(string? Name, string? Note, string? Error)> ResolveGameAsync(string? input,
+        CancellationToken cancellationToken)
+    {
+        var name = string.IsNullOrWhiteSpace(input) ? null : WhitespaceRegex().Replace(input.Trim(), " ");
+        if (name is null)
+        {
+            return (null, null, "Give the game's name as Twitch shows it.");
+        }
+
+        if (name.Length > PriorityGamesService.MaxNameLength)
+        {
+            return (null, null, $"A game name is at most {PriorityGamesService.MaxNameLength} characters.");
+        }
+
+        var known = GameNames().FirstOrDefault(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase));
+        if (known is not null)
+        {
+            return (known, null, null);
+        }
+
+        var found = await _source.GameLookup.FindAsync(name, cancellationToken);
+        if (!found.Checked)
+        {
+            return (name, "Twitch couldn't be asked, so the name was taken as typed; check it matches the game's Twitch name.",
+                null);
+        }
+
+        return found.Name is null
+            ? (null, null, $"Twitch has no game called \"{name}\". Use the name shown on the game's Twitch page.")
+            : (found.Name, null, null);
     }
 
     public BackendResult RemovePriorityGame(string? name)
@@ -305,7 +409,7 @@ public sealed partial class WebBackend
             return BackendResult.NotFound("That game isn't a priority game.");
         }
 
-        return BackendResult.Ok(BuildPriorityGames());
+        return BackendResult.Ok(new PriorityChangeDto(BuildPriorityGames(), name?.Trim(), null));
     }
 
     public BackendResult SwitchNow(string accountId)
@@ -450,6 +554,7 @@ public sealed partial class WebBackend
             CampaignsVersion(account),
             account.Campaigns.Count,
             account.OnlyFavouriteGames,
+            _source.Favourites.AccountsWithOwnList.Contains(account.Login, StringComparer.OrdinalIgnoreCase),
             NextPriority(account));
     }
 
@@ -508,6 +613,9 @@ public sealed partial class WebBackend
 
     [GeneratedRegex(@"(\{width\}x\{height\}|\d+x\d+)(?=\.(jpg|jpeg|png|webp)$)", RegexOptions.IgnoreCase)]
     private static partial Regex SizeRegex();
+
+    [GeneratedRegex(@"\s+")]
+    private static partial Regex WhitespaceRegex();
 
     /// <summary>Where one campaign stands for one account, from the best source available.</summary>
     private sealed record Resolved(string State, CampaignStatus? Status, bool NeedsLink);

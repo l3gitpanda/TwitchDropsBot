@@ -265,7 +265,7 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
   left: 0; right: 0; bottom: 0;
   z-index: 30;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   padding: 0 6px env(safe-area-inset-bottom);
   background: color-mix(in srgb, var(--surface) 92%, transparent);
   -webkit-backdrop-filter: saturate(1.4) blur(16px);
@@ -716,6 +716,39 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 }
 .prio-empty { color: var(--text-3); font-size: 14px; padding: 12px 0; border-bottom: 1px solid var(--hairline); }
 .prio-add { display: flex; gap: 8px; margin-top: 12px; }
+
+/* ---------- favourite games ---------- */
+
+#favourites-body .section-head { margin-top: 26px; }
+#favourite-note .callout { margin-bottom: 12px; }
+.fav-card { padding: 2px 14px 6px; }
+.fav-add { margin: 12px 0 6px; }
+.fav-list { list-style: none; margin: 0; padding: 0; }
+.fav-game {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 52px;
+  border-top: 1px solid var(--hairline);
+}
+.fav-open {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 8px 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.fav-open .name { font-weight: 650; overflow-wrap: anywhere; }
+.fav-open .sub { font-size: 13px; color: var(--text-3); }
+.fav-open:hover .name { color: var(--accent-ink); }
+.prio-toggle .icon { color: var(--text-3); opacity: 0.45; }
+.prio-toggle[aria-pressed="true"] .icon { color: var(--accent-ink); opacity: 1; }
+.fav-list .prio-empty { border-bottom: 0; border-top: 1px solid var(--hairline); }
 .prio-add .search { min-width: 0; }
 .prio-add .search .icon { color: var(--accent-ink); }
 

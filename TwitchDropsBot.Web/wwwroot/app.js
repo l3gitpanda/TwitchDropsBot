@@ -42,8 +42,12 @@ const TABS = [
   ['now', 'Now', 'now'],
   ['queue', 'Queue', 'queue'],
   ['campaigns', 'Campaigns', 'grid'],
+  ['games', 'Games', 'star'],
   ['activity', 'Activity', 'activity'],
 ];
+
+// Views that share the right-hand column on a desktop
+const RIGHT = ['campaigns', 'games', 'activity'];
 
 const KEY = { account: 'tdb.account', tab: 'tdb.tab', right: 'tdb.right', theme: 'tdb.theme', filter: 'tdb.filter', sort: 'tdb.sort', logLevel: 'tdb.logLevel' };
 
@@ -59,6 +63,7 @@ const store = {
   filter: localStorage.getItem(KEY.filter) || 'all',
   sort: localStorage.getItem(KEY.sort) || 'ending',
   search: '',
+  favouriteFilter: '',
   campaigns: new Map(),
   logs: new Map(),
   logLevel: localStorage.getItem(KEY.logLevel) || 'info',
@@ -308,6 +313,11 @@ const priorityGames = () => store.state?.priorityGames ?? [];
 // Worked out here rather than taken from the campaign list, so a change shows before the list is fetched again
 const priorityOf = (gameName) => (gameName ? priorityGames().find((g) => g.name.toLowerCase() === gameName.toLowerCase()) ?? null : null);
 const isPriority = (c) => Boolean(priorityOf(c.gameName));
+const favouriteGames = () => store.state?.favouriteGames ?? [];
+// An account with its own list in config.json keeps what the bot reported for it
+const isFavourite = (account, c) => (account?.hasOwnFavourites
+  ? c.isFavourite
+  : Boolean(c.gameName) && favouriteGames().some((g) => g.toLowerCase() === c.gameName.toLowerCase()));
 const accountById = (id) => accounts().find((a) => a.id === id);
 const currentAccount = () => accountById(store.accountId);
 const accountSlot = (account) => (accounts().indexOf(account) % 4) + 1;
@@ -343,15 +353,19 @@ function renderShell() {
         <section class="view" id="view-now" data-tab="now" aria-label="Now"></section>
         <section class="view" id="view-queue" data-tab="queue" aria-label="Queue">
           <div id="queue-body"></div>
-          <div id="priority-body"></div>
         </section>
       </div>
       <div class="col-right">
         <div class="panel-switch" role="tablist" aria-label="Panel">
           <button role="tab" data-right="campaigns">${icon('grid', 'sm')} Campaigns</button>
+          <button role="tab" data-right="games">${icon('star', 'sm')} Games</button>
           <button role="tab" data-right="activity">${icon('activity', 'sm')} Activity</button>
         </div>
         <section class="view" id="view-campaigns" data-tab="campaigns" aria-label="Campaigns"></section>
+        <section class="view" id="view-games" data-tab="games" aria-label="Games">
+          <div id="priority-body"></div>
+          <div id="favourites-body"></div>
+        </section>
         <section class="view" id="view-activity" data-tab="activity" aria-label="Activity"></section>
       </div>
     </div>
@@ -360,6 +374,7 @@ function renderShell() {
     </nav>`);
   renderCampaignsFrame();
   renderPriorityFrame();
+  renderFavouritesFrame();
   renderActivityFrame();
 }
 
@@ -370,9 +385,10 @@ function renderAll() {
   renderNow();
   if (!store.dragging) renderQueue();
   renderPriority();
+  renderFavourites();
   renderCampaignList();
   if (activityVisible()) pollLogs();
-  if (campaignsVisible()) ensureCampaigns();
+  if (campaignsVisible() || gamesVisible()) ensureCampaigns();
   if (store.sheet) renderSheet();
 }
 
@@ -408,18 +424,19 @@ function renderTabs() {
 }
 
 const campaignsVisible = () => (desktop.matches ? store.right === 'campaigns' : store.tab === 'campaigns');
+const gamesVisible = () => (desktop.matches ? store.right === 'games' : store.tab === 'games');
 const activityVisible = () => (desktop.matches ? store.right === 'activity' : store.tab === 'activity');
 
 function selectTab(tab) {
   store.tab = tab;
   localStorage.setItem(KEY.tab, tab);
-  if (tab === 'campaigns' || tab === 'activity') {
+  if (RIGHT.includes(tab)) {
     store.right = tab;
     localStorage.setItem(KEY.right, tab);
   }
   renderTabs();
   if (!desktop.matches) window.scrollTo({ top: 0 });
-  if (campaignsVisible()) ensureCampaigns();
+  if (campaignsVisible() || gamesVisible()) ensureCampaigns();
   if (activityVisible()) {
     renderActivity(true);
     pollLogs();
@@ -430,7 +447,7 @@ function selectRight(panel) {
   store.right = panel;
   localStorage.setItem(KEY.right, panel);
   renderTabs();
-  if (campaignsVisible()) ensureCampaigns();
+  if (campaignsVisible() || gamesVisible()) ensureCampaigns();
   if (activityVisible()) {
     renderActivity(true);
     pollLogs();
@@ -657,7 +674,7 @@ function renderQueue() {
   const finished = account.queue.filter((q) => q.state === 'done' || q.state === 'ended' || q.state === 'unavailable');
   setHtml(view, html`
     <div class="section-head"><h2>Queue</h2><span class="hint">${account.queue.length ? `${account.queue.length} queued` : ''}</span></div>
-    <p class="help">Watched ${priorityGames().length ? 'after any live campaign of a priority game' : 'first'}, top to bottom. When nothing here can be watched, the bot falls back to its normal order${account.onlyFavourites ? ' (favourites only)' : ''}.</p>
+    <p class="help">Watched ${priorityGames().length ? 'after any live campaign of a priority game (see Games)' : 'first'}, top to bottom. When nothing here can be watched, the bot falls back to its normal order${account.onlyFavourites ? ' (favourites only)' : ''}.</p>
     ${account.queue.length
       ? html`<ol class="card list" id="queue-list">${account.queue.map((item, i) => queueRow(account, item, i, true))}</ol>`
       : html`<div class="card empty">${icon('queue')}<h3>Nothing queued</h3><p>Queue a campaign to watch it before anything else. Queued campaigns are farmed even if their game isn't a favourite.</p><button class="btn primary" data-goto="campaigns">${icon('plus', 'sm')}Browse campaigns</button></div>`}
@@ -848,16 +865,16 @@ async function addPriority(name) {
     toast(`${known.name} is already a priority game`);
     return true;
   }
-  let games;
+  let result;
   try {
-    games = await api('/api/priority-games', { method: 'POST', body: { name } });
+    result = await api('/api/priority-games', { method: 'POST', body: { name } });
   } catch (e) {
     toast(e.message, { error: true });
     return false;
   }
-  // The bot stores a known game as Twitch spells it
-  const stored = games?.find((g) => g.name.toLowerCase() === name.toLowerCase())?.name ?? name;
-  toast(`${stored} is now a priority game`, { action: { label: 'Undo', run: () => removePriority(stored, { quiet: true }) } });
+  // The bot stores the name as Twitch spells it
+  const stored = result?.name ?? name;
+  toast(`${stored} is now a priority game${result?.note ? `. ${result.note}` : ''}`, { action: { label: 'Undo', run: () => removePriority(stored, { quiet: true }) } });
   return true;
 }
 
@@ -870,6 +887,146 @@ async function removePriority(name, { quiet = false } = {}) {
   }
   if (!quiet) toast(`${name} is no longer a priority game`, { action: { label: 'Undo', run: () => addPriority(name) } });
   return true;
+}
+
+// ---------------------------------------------------------------- favourite games
+
+function renderFavouritesFrame() {
+  setHtml($('#favourites-body'), html`
+    <div class="section-head"><h2>Favourite games</h2><span class="hint" id="favourite-count"></span></div>
+    <p class="help" id="favourite-help"></p>
+    <div id="favourite-note"></div>
+    <div class="card fav-card">
+      <form class="prio-add fav-add" id="favourite-form" autocomplete="off">
+        <label class="search">${icon('star', 'sm')}<span class="visually-hidden">Filter the favourites, or name a game to add</span><input id="favourite-input" type="text" list="favourite-suggest" maxlength="100" placeholder="Filter or add a game" enterkeyhint="done"></label>
+        <button class="btn" type="submit">${icon('plus', 'sm')}Add</button>
+      </form>
+      <datalist id="favourite-suggest"></datalist>
+      <ul class="fav-list" id="favourite-list"></ul>
+    </div>`);
+
+  const input = $('#favourite-input');
+  input.addEventListener('input', () => {
+    store.favouriteFilter = input.value;
+    renderFavourites(true);
+  });
+  $('#favourite-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = input.value.trim().replace(/\s+/g, ' ');
+    if (!name) return;
+    const button = $('button[type=submit]', event.currentTarget);
+    button.disabled = true;
+    if (await addFavourite(name)) {
+      input.value = '';
+      store.favouriteFilter = '';
+      renderFavourites(true);
+    }
+    button.disabled = false;
+  });
+}
+
+let lastFavouritesKey = '';
+function renderFavourites(force = false) {
+  const host = $('#favourite-list');
+  if (!host || !store.state) return;
+  const account = currentAccount();
+  const games = favouriteGames();
+  const cached = account ? store.campaigns.get(account.id) : null;
+  const own = store.state.ownFavouriteLists ?? [];
+  const key = JSON.stringify([games, priorityGames(), own, account?.id, account?.onlyFavourites, cached?.version, Boolean(cached?.campaigns), store.favouriteFilter, store.state.gameNames]);
+  if (!force && key === lastFavouritesKey) return;
+  lastFavouritesKey = key;
+
+  $('#favourite-count').textContent = `${games.length} · every account`;
+  $('#favourite-help').textContent = `${account?.onlyFavourites ? 'The bot farms only these games' : 'Campaigns for these games go before other games'}, after priority games and the queue. Kept in config.json; a change counts from the bot's next pick. A typed name is checked with Twitch.`;
+  setHtml($('#favourite-note'), own.length
+    ? html`<div class="callout warn">${icon('alert', 'sm')}<div class="grow"><strong>${own.join(', ')}</strong> ${own.length === 1 ? 'has' : 'have'} a favourites list of ${own.length === 1 ? 'its' : 'their'} own in config.json, which replaces this one and isn't edited here.</div></div>`
+    : '');
+
+  // Campaigns per game for the account on screen, running and upcoming
+  const counts = new Map();
+  for (const c of cached?.campaigns ?? []) {
+    const game = (c.gameName || '').toLowerCase();
+    const entry = counts.get(game) ?? { running: 0, upcoming: 0 };
+    if (c.status === 'upcoming') entry.upcoming++;
+    else entry.running++;
+    counts.set(game, entry);
+  }
+  const countText = (name) => {
+    if (!cached?.campaigns) return '';
+    const { running = 0, upcoming = 0 } = counts.get(name.toLowerCase()) ?? {};
+    const parts = [];
+    if (running) parts.push(`${running} ${running === 1 ? 'campaign' : 'campaigns'} now`);
+    if (upcoming) parts.push(`${upcoming} upcoming`);
+    return parts.length ? parts.join(' · ') : 'No campaign right now';
+  };
+
+  const filter = store.favouriteFilter.trim().toLowerCase();
+  const shown = games.filter((name) => name.toLowerCase().includes(filter));
+  setHtml(host, shown.length
+    ? shown.map((name) => {
+      const prio = priorityOf(name);
+      return html`<li class="fav-game">
+        <button class="fav-open" data-fav-search="${name}" aria-label="${name}: show its campaigns">
+          <span class="name">${name}</span>
+          <span class="sub">${countText(name)}</span>
+        </button>
+        <button class="btn ghost square sm prio-toggle" data-action="${prio ? 'priority-remove' : 'priority-add'}" data-name="${prio?.name ?? name}" aria-pressed="${Boolean(prio)}" aria-label="${prio ? `${name} is a priority game; remove it from the priority games` : `Make ${name} a priority game`}" title="${prio ? 'Priority game' : 'Make it a priority game'}" ${raw(prio?.fromConfig ? 'disabled' : '')}>${icon('bolt', 'sm')}</button>
+        <button class="btn ghost square sm" data-action="favourite-remove" data-name="${name}" aria-label="Remove ${name} from the favourites">${icon('x', 'sm')}</button>
+      </li>`;
+    })
+    : html`<li class="prio-empty">${games.length ? `No favourite matches “${store.favouriteFilter.trim()}”. Use Add to make it one.` : 'No favourite games yet.'}</li>`);
+
+  const taken = new Set(games.map((name) => name.toLowerCase()));
+  setHtml($('#favourite-suggest'), (store.state.gameNames ?? [])
+    .filter((name) => !taken.has(name.toLowerCase()))
+    .map((name) => html`<option value="${name}"></option>`));
+}
+
+function applyFavourites(games) {
+  if (!store.state) return;
+  store.state.favouriteGames = games;
+  renderFavourites(true);
+  renderCampaignList(true);
+  if (store.sheet) renderSheet();
+}
+
+async function addFavourite(name) {
+  let result;
+  try {
+    result = await api('/api/favourite-games', { method: 'POST', body: { name } });
+  } catch (e) {
+    toast(e.message, { error: true });
+    return false;
+  }
+  applyFavourites(result.games);
+  if (!result.added) toast(`${result.name} is already a favourite`);
+  else toast(`${result.name} is now a favourite${result.note ? `. ${result.note}` : ''}`, { action: { label: 'Undo', run: () => removeFavourite(result.name, { quiet: true }) } });
+  return true;
+}
+
+async function removeFavourite(name, { quiet = false } = {}) {
+  let result;
+  try {
+    result = await api(`/api/favourite-games?name=${enc(name)}`, { method: 'DELETE' });
+  } catch (e) {
+    toast(e.message, { error: true });
+    return false;
+  }
+  applyFavourites(result.games);
+  if (!quiet) toast(`${name} is no longer a favourite`, { action: { label: 'Undo', run: () => addFavourite(name) } });
+  return true;
+}
+
+function showGameCampaigns(name) {
+  store.search = name;
+  store.filter = 'all';
+  localStorage.setItem(KEY.filter, 'all');
+  const search = $('#campaign-search');
+  if (search) search.value = name;
+  if (desktop.matches) selectRight('campaigns');
+  else selectTab('campaigns');
+  renderCampaignList(true);
 }
 
 // ---------------------------------------------------------------- campaigns
@@ -928,6 +1085,7 @@ async function ensureCampaigns(force = false) {
     if (force) toast(e.message, { error: true });
   }
   renderCampaignList(true);
+  renderFavourites(true);
 }
 
 function filterCampaigns(account, list) {
@@ -935,7 +1093,7 @@ function filterCampaigns(account, list) {
   const soon = now() + 24 * 3600e3;
   const test = {
     all: () => true,
-    favourites: (c) => c.isFavourite,
+    favourites: (c) => isFavourite(account, c),
     priority: isPriority,
     queued: (c) => queuePosition(account, c.id),
     progress: (c) => c.status === 'inProgress' || c.isWatching,
@@ -968,7 +1126,7 @@ function renderCampaignList(force = false) {
   if (!host || !account) return;
 
   const cached = store.campaigns.get(account.id);
-  const key = JSON.stringify([account.id, account.queue.map((q) => q.campaignId), account.watching?.campaignId, account.onlyFavourites, priorityGames().map((g) => g.name), cached?.version, cached?.loading, cached?.error, store.filter, store.sort, store.search]);
+  const key = JSON.stringify([account.id, account.queue.map((q) => q.campaignId), account.watching?.campaignId, account.onlyFavourites, priorityGames().map((g) => g.name), favouriteGames(), cached?.version, cached?.loading, cached?.error, store.filter, store.sort, store.search]);
   if (!force && key === lastListKey) return;
   lastListKey = key;
 
@@ -1021,7 +1179,7 @@ function campaignBadges(account, c) {
     ${watching ? html`<span class="badge watching"><span class="dot live"></span>Watching</span>` : ''}
     ${isPriority(c) ? html`<span class="badge prio">${icon('bolt')}Priority</span>` : ''}
     ${c.status === 'upcoming' ? html`<span class="badge">${icon('clock')}Upcoming</span>` : ''}
-    ${c.isFavourite ? html`<span class="badge fav">${icon('star')}Favourite</span>` : account.onlyFavourites && !isPriority(c) ? html`<span class="badge muted">Not a favourite</span>` : ''}
+    ${isFavourite(account, c) ? html`<span class="badge fav">${icon('star')}Favourite</span>` : account.onlyFavourites && !isPriority(c) ? html`<span class="badge muted">Not a favourite</span>` : ''}
     ${linkBadge(c)}
     ${c.isAvoided ? html`<span class="badge muted">Avoided</span>` : ''}`;
 }
@@ -1201,7 +1359,7 @@ function renderSheet() {
       ${priorityLine}
       ${c.link === 'unlinked' && c.status !== 'waitingClaim' ? html`<div class="callout warn">${icon('link', 'sm')}<div class="grow"><strong>${account.login} isn't linked to this game.</strong> Watching still counts, and Twitch hands the drops over once the account is linked.${linkUrl ? html` <a href="${linkUrl}" target="_blank" rel="noopener noreferrer">Link the account</a>` : ''}</div></div>` : ''}
       ${c.link === 'unlinked' && c.status === 'waitingClaim' && linkUrl ? html`<div class="sheet-links"><a class="btn sm" href="${linkUrl}" target="_blank" rel="noopener noreferrer">${icon('link', 'sm')}Link the account</a></div>` : ''}
-      ${!c.isFavourite && !prio && account.onlyFavourites && c.kind !== 'reward' ? html`<div class="callout info">${icon('star', 'sm')}<div class="grow">Not in the favourites list, so the bot only farms it while it's queued.</div></div>` : ''}
+      ${!isFavourite(account, c) && !prio && account.onlyFavourites && c.kind !== 'reward' ? html`<div class="callout info">${icon('star', 'sm')}<div class="grow">Not in the favourites list, so the bot only farms it while it's queued.</div>${c.gameName && !account.hasOwnFavourites ? html`<button class="link-btn" data-action="favourite-add" data-name="${c.gameName}">Add to favourites</button>` : ''}</div>` : ''}
       <h4>Drops${c.totalMinutes ? html` · all in ${minutesText(c.totalMinutes)}` : ''}</h4>
       ${s.loading && !tiers ? html`<div class="skeleton" data-skeleton></div>` : ''}
       ${tiers?.length ? tierList(tiers, { all: true, sheet: true }) : ''}
@@ -1389,7 +1547,7 @@ function appMenu(anchor) {
 // ---------------------------------------------------------------- events
 
 document.addEventListener('click', async (event) => {
-  const target = event.target.closest('[data-action],[data-goto],[data-account],[data-open],[data-quick-add],[data-menu],[data-tab-button],[data-right],[data-filter],[data-log-level]');
+  const target = event.target.closest('[data-action],[data-goto],[data-account],[data-open],[data-quick-add],[data-menu],[data-tab-button],[data-right],[data-filter],[data-log-level],[data-fav-search]');
   if (!target || target.disabled) return;
   const account = currentAccount();
   const d = target.dataset;
@@ -1399,7 +1557,7 @@ document.addEventListener('click', async (event) => {
   if (d.account) return selectAccount(d.account);
   if (d.goto) {
     if (sheet.open) closeSheet();
-    if (desktop.matches && (d.goto === 'campaigns' || d.goto === 'activity')) return selectRight(d.goto);
+    if (desktop.matches && RIGHT.includes(d.goto)) return selectRight(d.goto);
     return selectTab(d.goto);
   }
   if (d.filter) {
@@ -1413,6 +1571,7 @@ document.addEventListener('click', async (event) => {
     return renderActivity(true);
   }
   if ('open' in d) return openCampaign(d.open);
+  if (d.favSearch) return showGameCampaigns(d.favSearch);
   if (d.quickAdd) {
     const c = cachedCampaign(account.id, d.quickAdd);
     target.disabled = true;
@@ -1462,6 +1621,8 @@ document.addEventListener('click', async (event) => {
     case 'sheet-remove': return removeFromQueue(store.sheet.accountId, store.sheet.campaignId);
     case 'priority-add': return addPriority(d.name);
     case 'priority-remove': return removePriority(d.name);
+    case 'favourite-add': return addFavourite(d.name);
+    case 'favourite-remove': return removeFavourite(d.name);
     case 'sheet-recheck': return openCampaign(store.sheet.campaignId, store.sheet.accountId, { recheck: true });
     case 'sheet-top': return moveInQueue(accountById(store.sheet.accountId), store.sheet.campaignId, 0, 0);
     default:

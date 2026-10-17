@@ -3,7 +3,14 @@ namespace TwitchDropsBot.Web.Api;
 // What the page receives. Built from the bot's state; never carries tokens, the webhook or other config.
 
 public record StateDto(string Version, bool Demo, IReadOnlyList<AccountDto> Accounts,
-    IReadOnlyList<PriorityGameDto> PriorityGames, IReadOnlyList<string> GameNames);
+    IReadOnlyList<PriorityGameDto> PriorityGames, IReadOnlyList<string> FavouriteGames,
+    IReadOnlyList<string> OwnFavouriteLists, IReadOnlyList<string> GameNames);
+
+/// <summary>The priority games after a change, the name as stored, and anything worth saying about it.</summary>
+public record PriorityChangeDto(IReadOnlyList<PriorityGameDto> Games, string? Name, string? Note);
+
+/// <summary>The favourite games after a change, the name as stored, and anything worth saying about it.</summary>
+public record FavouriteChangeDto(IReadOnlyList<string> Games, string? Name, bool Added, string? Note);
 
 /// <summary>A priority game. One set in config.json can only be removed there.</summary>
 public record PriorityGameDto(string Name, bool FromConfig);
@@ -26,6 +33,7 @@ public record AccountDto(
     string CampaignsVersion,
     int CampaignCount,
     bool OnlyFavourites,
+    bool HasOwnFavourites,
     UpcomingDto? NextPriority);
 
 public record WatchingDto(
@@ -111,6 +119,8 @@ public record QueueRequest(string CampaignId, string? Position, bool SwitchNow);
 public record ReorderRequest(IReadOnlyList<string> CampaignIds);
 
 public record PriorityGameRequest(string? Name);
+
+public record FavouriteGameRequest(string? Name);
 
 public record LoginRequest(string? Password);
 

@@ -3,6 +3,7 @@ using TwitchDropsBot.Core.Platform.Shared.Services;
 using TwitchDropsBot.Core.Platform.Twitch.Bot;
 using TwitchDropsBot.Core.Platform.Twitch.Models;
 using TwitchDropsBot.Core.Platform.Twitch.Models.Abstractions;
+using TwitchDropsBot.Web.Games;
 
 namespace TwitchDropsBot.Web.Accounts;
 
@@ -81,5 +82,7 @@ public interface IAccountSource
     IReadOnlyList<IAccount> Accounts { get; }
     CampaignQueueService Queue { get; }
     PriorityGamesService Priority { get; }
+    IFavouriteGames Favourites { get; }
+    IGameLookup GameLookup { get; }
     CampaignStatusStore Store { get; }
 }
