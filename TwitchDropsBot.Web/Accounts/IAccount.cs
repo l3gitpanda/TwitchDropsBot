@@ -29,6 +29,9 @@ public interface IAccount
     AbstractCampaign? CheckingCampaign { get; }
 
     IReadOnlyList<AbstractCampaign> Campaigns { get; }
+
+    /// <summary>Drop campaigns Twitch lists as not started yet; empty when it lists none.</summary>
+    IReadOnlyList<AbstractCampaign> UpcomingCampaigns { get; }
     DateTime? CampaignsAt { get; }
     Inventory? Inventory { get; }
     IReadOnlyDictionary<string, CampaignNote> Notes { get; }
@@ -77,5 +80,6 @@ public interface IAccountSource
 {
     IReadOnlyList<IAccount> Accounts { get; }
     CampaignQueueService Queue { get; }
+    PriorityGamesService Priority { get; }
     CampaignStatusStore Store { get; }
 }

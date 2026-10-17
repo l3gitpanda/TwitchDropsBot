@@ -22,20 +22,32 @@ public sealed class DemoAccountSource : IAccountSource, IDisposable
     {
         var queuePath = Path.Combine(Path.GetTempPath(), $"tdb-demo-queue-{Environment.ProcessId}.json");
         Queue = new CampaignQueueService(loggerFactory.CreateLogger<CampaignQueueService>(), queuePath);
+        // Made-up data starts the same every time, even when a process id comes round again
+        var priorityPath = Path.Combine(Path.GetTempPath(), $"tdb-demo-priority-{Environment.ProcessId}.json");
+        File.Delete(priorityPath);
+        Priority = new PriorityGamesService(loggerFactory.CreateLogger<PriorityGamesService>(), null, priorityPath);
+        foreach (var game in DemoCatalogue.PriorityGames)
+        {
+            Priority.Add(game);
+        }
+
         var statusDirectory = Directory.CreateTempSubdirectory("tdb-demo-status").FullName;
         Store = new CampaignStatusStore(statusDirectory, loggerFactory.CreateLogger<CampaignStatusStore>());
 
         var catalogue = DemoCatalogue.Build();
+        var upcoming = DemoCatalogue.BuildUpcoming();
         _accounts = new List<DemoAccount>
         {
-            new("100000001", "ana_demo", catalogue, Queue, Store, DemoCatalogue.FirstAccountSetup),
-            new("100000002", "ben_demo", catalogue, Queue, Store, DemoCatalogue.SecondAccountSetup)
+            new("100000001", "ana_demo", catalogue, upcoming, Queue, Priority, Store, DemoCatalogue.FirstAccountSetup),
+            new("100000002", "ben_demo", catalogue, upcoming, Queue, Priority, Store, DemoCatalogue.SecondAccountSetup)
         };
 
         _timer = new Timer(_ => Step(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
     }
 
     public CampaignQueueService Queue { get; }
+
+    public PriorityGamesService Priority { get; }
 
     public CampaignStatusStore Store { get; }
 
@@ -56,7 +68,9 @@ internal sealed class DemoAccount : IAccount
 {
     private readonly object _lock = new();
     private readonly CampaignQueueService _queue;
+    private readonly PriorityGamesService _priority;
     private readonly List<AbstractCampaign> _campaigns;
+    private readonly List<AbstractCampaign> _upcoming;
     private readonly Dictionary<string, CampaignNote> _notes = new();
     private readonly Dictionary<string, int[]> _progress = new();   // campaign id -> minutes per tier
     private readonly HashSet<string> _offline;
@@ -70,12 +84,13 @@ internal sealed class DemoAccount : IAccount
     private bool _reselect;
     private DateTime _phaseUntil;
 
-    public DemoAccount(string id, string login, List<AbstractCampaign> catalogue, CampaignQueueService queue,
-        CampaignStatusStore store, Action<DemoSetup> setup)
+    public DemoAccount(string id, string login, List<AbstractCampaign> catalogue, List<AbstractCampaign> upcoming,
+        CampaignQueueService queue, PriorityGamesService priority, CampaignStatusStore store, Action<DemoSetup> setup)
     {
         Id = id;
         Login = login;
         _queue = queue;
+        _priority = priority;
         _store = store;
 
         var options = new DemoSetup();
@@ -85,6 +100,7 @@ internal sealed class DemoAccount : IAccount
         _linked = options.Linked;
         _unclaimed = options.Unclaimed;
         _campaigns = catalogue.Select(x => DemoCatalogue.ForAccount(x, _linked)).ToList();
+        _upcoming = upcoming.Select(x => DemoCatalogue.ForAccount(x, _linked)).ToList();
         FavouriteGames = DemoCatalogue.Favourites;
 
         foreach (var (campaignId, minutes) in options.Progress)
@@ -221,6 +237,7 @@ internal sealed class DemoAccount : IAccount
     public IReadOnlyList<DropProgressInfo>? CurrentDropsProgress { get; private set; }
     public AbstractCampaign? CheckingCampaign { get; private set; }
     public IReadOnlyList<AbstractCampaign> Campaigns => _campaigns;
+    public IReadOnlyList<AbstractCampaign> UpcomingCampaigns => _upcoming;
     public DateTime? CampaignsAt { get; private set; }
     public IReadOnlyList<string> FavouriteGames { get; }
     public bool OnlyFavouriteGames => true;
@@ -283,7 +300,7 @@ internal sealed class DemoAccount : IAccount
         CancellationToken cancellationToken)
     {
         await Task.Delay(250, cancellationToken);
-        return _campaigns.FirstOrDefault(x => x.Id == campaignId);
+        return _campaigns.FirstOrDefault(x => x.Id == campaignId) ?? _upcoming.FirstOrDefault(x => x.Id == campaignId);
     }
 
     public void RequestReselect()
@@ -329,6 +346,14 @@ internal sealed class DemoAccount : IAccount
                     CheckingCampaign = NextCandidate();
                     _phaseUntil = now.AddSeconds(5);
                     break;
+                case BotStatus.Watching when PriorityToSwitchTo() is { } priority:
+                    Logs.Add(LogEventLevel.Information,
+                        $"Priority game {priority.Game?.DisplayName} is live: switching from {CurrentCampaign?.Name} to {priority.Name} on {DemoCatalogue.ChannelFor(priority)}");
+                    Status = BotStatus.Seeking;
+                    IdleReason = BotIdleReason.Switching;
+                    CheckingCampaign = priority;
+                    _phaseUntil = now.AddSeconds(5);
+                    break;
                 case BotStatus.Watching:
                     WatchMinute();
                     break;
@@ -338,6 +363,10 @@ internal sealed class DemoAccount : IAccount
 
     private AbstractCampaign? NextCandidate()
     {
+        var priority = _campaigns
+            .Where(x => _priority.Contains(x.Game?.DisplayName))
+            .OrderBy(x => x.EndAt);
+
         var queued = _queue.GetCampaignIds(Id)
             .Select(id => _campaigns.FirstOrDefault(x => x.Id == id))
             .OfType<AbstractCampaign>();
@@ -346,7 +375,21 @@ internal sealed class DemoAccount : IAccount
             .Where(x => x.Game?.DisplayName is { } game && FavouriteGames.Contains(game))
             .OrderBy(x => x.EndAt);
 
-        return queued.Concat(normal).FirstOrDefault(x => x is DropCampaign && !IsDone(x) && !_offline.Contains(x.Id));
+        return priority.Concat(queued).Concat(normal)
+            .FirstOrDefault(x => x is DropCampaign && !IsDone(x) && !_offline.Contains(x.Id));
+    }
+
+    // As the bot does: a watch gives way to a live priority campaign, unless it is watching one that ends sooner
+    private AbstractCampaign? PriorityToSwitchTo()
+    {
+        var current = CurrentCampaign;
+        var next = NextCandidate();
+        if (current is null || next is null || next.Id == current.Id || !_priority.Contains(next.Game?.DisplayName))
+        {
+            return null;
+        }
+
+        return !_priority.Contains(current.Game?.DisplayName) || next.EndAt < current.EndAt ? next : null;
     }
 
     private void PickNext()
@@ -472,6 +515,8 @@ internal sealed class DemoSetup
 internal static class DemoCatalogue
 {
     private const string BoxArt = "https://static-cdn.jtvnw.net/ttv-boxart/";
+
+    public static readonly List<string> PriorityGames = new() { "Warframe" };
 
     public static readonly List<string> Favourites = new()
     {
@@ -683,6 +728,34 @@ internal static class DemoCatalogue
         };
 
         return campaigns;
+    }
+
+    // Campaigns Twitch lists before they start: a devstream of a priority game, and a season further out
+    public static List<AbstractCampaign> BuildUpcoming()
+    {
+        var now = DateTime.UtcNow;
+        var devstream = Drop("wf-devstream", "Devstream 199", "Warframe", now.AddHours(51).AddMinutes(10),
+            ("Devstream Glyph", 30));
+        devstream.StartAt = now.AddHours(50).AddMinutes(10);
+        var season = Drop("ow-s20", "Season 20 Drops", "Overwatch", now.AddDays(19),
+            ("Season 20 Spray", 60), ("Player Icon", 120), ("Name Card", 180));
+        season.StartAt = now.AddDays(5);
+
+        var campaigns = new List<DropCampaign> { devstream, season };
+        foreach (var campaign in campaigns)
+        {
+            campaign.Status = "UPCOMING";
+            campaign.AccountLinkURL = $"https://example.invalid/link/{campaign.Id}";
+            campaign.DetailsURL = $"https://www.twitch.tv/drops/campaigns?dropID={campaign.Id}";
+        }
+
+        devstream.Allow = new DropCampaignACL
+        {
+            IsEnabled = true,
+            Channels = new List<Channel> { new() { Name = "warframe", DisplayName = "Warframe" } }
+        };
+
+        return campaigns.Cast<AbstractCampaign>().ToList();
     }
 
     public static AbstractCampaign ForAccount(AbstractCampaign campaign, HashSet<string> linked)

@@ -144,6 +144,9 @@ public class TwitchUser : BotUser
     }
 
     public DateTime? AvailableCampaignsAt { get; set; }
+
+    // Drop campaigns Twitch lists as not started yet, as of the last fetch
+    public List<AbstractCampaign> UpcomingCampaigns { get; set; } = new();
     public AbstractCampaign? CheckingCampaign { get; set; }
     public List<DropProgressInfo>? CurrentDropsProgress { get; set; }
     public ConcurrentDictionary<string, CampaignNote> CampaignNotes { get; } = new();

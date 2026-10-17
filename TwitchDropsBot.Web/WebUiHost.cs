@@ -68,6 +68,7 @@ public sealed class WebUiHost
             : new LiveAccountSource(
                 botServices.GetRequiredService<BotRegistry>(),
                 botServices.GetRequiredService<CampaignQueueService>(),
+                botServices.GetRequiredService<PriorityGamesService>(),
                 botServices.GetRequiredService<IOptionsMonitor<BotSettings>>(),
                 new CampaignStatusStore(dataDirectory, loggerFactory.CreateLogger<CampaignStatusStore>()));
 

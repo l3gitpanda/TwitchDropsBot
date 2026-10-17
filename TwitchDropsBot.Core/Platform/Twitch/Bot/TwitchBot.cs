@@ -35,12 +35,21 @@ public class TwitchBot : BaseBot<TwitchUser>
     private readonly CampaignQueueService? _campaignQueue;
     private List<string> _queuedCampaignIds = new();
 
+    // A watch looks for a live campaign of a priority game every few minutes, at once after the list changes,
+    // and just after an upcoming one is due to start
+    private static readonly TimeSpan PriorityStartGrace = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan PriorityRetryAfter = TimeSpan.FromMinutes(30);
+    private readonly PriorityGamesService? _priorityGames;
+    private volatile bool _priorityCheckDue;
+    private readonly Dictionary<string, DateTime> _priorityRetryAt = new();
+
     public TwitchBot(
         TwitchUser user,
         ILogger logger,
         NotificationService notificationService,
         IOptionsMonitor<BotSettings> botSettings,
-        CampaignQueueService? campaignQueue = null
+        CampaignQueueService? campaignQueue = null,
+        PriorityGamesService? priorityGames = null
     ) : base(user, logger, notificationService, botSettings)
     {
         finishedCampaigns = new List<AbstractCampaign>();
@@ -50,7 +59,15 @@ public class TwitchBot : BaseBot<TwitchUser>
         _gamesToCheck = new List<string>();
 
         _campaignQueue = campaignQueue;
+
+        _priorityGames = priorityGames;
+        if (priorityGames is not null)
+        {
+            priorityGames.Changed += () => _priorityCheckDue = true;
+        }
     }
+
+    private IReadOnlyList<string> PriorityGames() => _priorityGames?.All ?? Array.Empty<string>();
 
     public override List<String> GetUserFavoriteGames()
     {
@@ -74,8 +91,16 @@ public class TwitchBot : BaseBot<TwitchUser>
         BotUser.OnlyFavouriteGames = TwitchSettings.OnlyFavouriteGames;
         BotUser.OnlyConnectedAccounts = TwitchSettings.OnlyConnectedAccounts;
 
+        // This cycle picks with the current priority list, so a change made before it needs no extra check
+        _priorityCheckDue = false;
+
         // Get campaigns
-        var thingsToWatch = await BotUser.TwitchRepository.FetchDropsAsync();
+        var dashboard = await BotUser.TwitchRepository.FetchDashboardAsync();
+        var thingsToWatch = dashboard.Active;
+        if (dashboard.Active.Count > 0 || dashboard.Upcoming.Count > 0)
+        {
+            BotUser.UpcomingCampaigns = dashboard.Upcoming;
+        }
         var inventory = await BotUser.TwitchRepository.FetchInventoryDropsAsync();
         DateTime now = DateTime.Now;
 
@@ -101,6 +126,10 @@ public class TwitchBot : BaseBot<TwitchUser>
         // Campaigns queued from the web UI go first and are exempt from the filters below
         _queuedCampaignIds = _campaignQueue?.GetCampaignIds(BotUser.Id).ToList() ?? new List<string>();
         var queuedCampaigns = CampaignQueueOrdering.FindQueued(thingsToWatch, _queuedCampaignIds);
+
+        // Campaigns of priority games go before the queue, soonest-ending first, and are exempt from the filters too
+        var priorityCampaigns = CampaignQueueOrdering.FindPriority(thingsToWatch, PriorityGames(),
+            TwitchSettings.AvoidCampaign);
 
         if (BotUser.OnlyConnectedAccounts)
         {
@@ -147,6 +176,7 @@ public class TwitchBot : BaseBot<TwitchUser>
 
         thingsToWatch = favouriteCampaigns.Concat(thingsToWatch).ToList();
         thingsToWatch = CampaignQueueOrdering.PutFirst(thingsToWatch, queuedCampaigns);
+        thingsToWatch = CampaignQueueOrdering.PutFirst(thingsToWatch, priorityCampaigns);
 
         TimeBasedDrop? timeBasedDrop = null;
         DropCurrentSession? dropCurrentSession = null;
@@ -518,6 +548,8 @@ public class TwitchBot : BaseBot<TwitchUser>
             );
         }
 
+        var nextPriorityCheck = NextPriorityCheck();
+
         while (minuteWatched <= requiredMinutesToWatch)
         {
             try
@@ -639,14 +671,152 @@ public class TwitchBot : BaseBot<TwitchUser>
                 );
             }
 
+            if (_priorityCheckDue || DateTime.UtcNow >= nextPriorityCheck)
+            {
+                _priorityCheckDue = false;
+                if (await FindLivePriorityCampaignAsync(campaign) is not null)
+                {
+                    BotUser.WatchManager.Close();
+                    throw new PriorityCampaignLive();
+                }
+
+                nextPriorityCheck = NextPriorityCheck();
+            }
+
             await Task.Delay(TimeSpan.FromSeconds(60), BotUser.CancellationTokenSource?.Token ?? System.Threading.CancellationToken.None);
         }
 
         BotUser.WatchManager.Close();
     }
 
+    // Every few minutes, or just after an upcoming campaign of a priority game is due to start if that is sooner
+    private DateTime NextPriorityCheck()
+    {
+        var next = DateTime.UtcNow + TimeSpan.FromMinutes(Math.Max(1, TwitchSettings.PriorityCheckMinutes));
+        return NextPriorityStart() is { } start && start + PriorityStartGrace < next
+            ? start + PriorityStartGrace
+            : next;
+    }
+
+    /// <summary>When the next upcoming campaign of a priority game starts, if Twitch lists one.</summary>
+    private DateTime? NextPriorityStart()
+    {
+        var priorityGames = PriorityGames();
+        if (priorityGames.Count == 0)
+        {
+            return null;
+        }
+
+        var now = DateTime.UtcNow;
+        return BotUser.UpcomingCampaigns
+            .Where(x => x.StartAt != default && CampaignQueueOrdering.IsPriority(x, priorityGames))
+            .Select(x => x.StartAt.Kind switch
+            {
+                DateTimeKind.Utc => x.StartAt,
+                DateTimeKind.Local => x.StartAt.ToUniversalTime(),
+                _ => DateTime.SpecifyKind(x.StartAt, DateTimeKind.Utc)
+            })
+            .Where(x => x > now)
+            .Order()
+            .Cast<DateTime?>()
+            .FirstOrDefault();
+    }
+
+    // Between cycles, wake up for a priority campaign due to start before the planned check
+    protected override TimeSpan LimitWait(TimeSpan waitingTime)
+    {
+        if (NextPriorityStart() is not { } start)
+        {
+            return waitingTime;
+        }
+
+        var untilStart = start + PriorityStartGrace - DateTime.UtcNow;
+        return untilStart > TimeSpan.Zero && untilStart < waitingTime ? untilStart : waitingTime;
+    }
+
+    /// <summary>
+    /// A live campaign of a priority game that the current watch should give way to, with a live channel to watch
+    /// it on and something left to earn there; otherwise null. Without priority games it does nothing at all.
+    /// </summary>
+    private async Task<AbstractCampaign?> FindLivePriorityCampaignAsync(AbstractCampaign current)
+    {
+        var priorityGames = PriorityGames();
+        if (priorityGames.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            // An empty answer is a failed fetch far more often than an empty dashboard; keep the cycle's lists then
+            var dashboard = await BotUser.TwitchRepository.FetchDashboardAsync();
+            if (dashboard.Active.Count == 0)
+            {
+                return null;
+            }
+
+            BotUser.AvailableCampaigns = dashboard.Active.ToList();
+            BotUser.AvailableCampaignsAt = DateTime.UtcNow;
+            BotUser.UpcomingCampaigns = dashboard.Upcoming;
+
+            var now = DateTime.UtcNow;
+            var candidates = CampaignQueueOrdering
+                .FindPriority(dashboard.Active, priorityGames, TwitchSettings.AvoidCampaign)
+                .Where(x => CampaignQueueOrdering.ShouldGiveWay(current, x, priorityGames) &&
+                            !finishedCampaigns.Contains(x) &&
+                            !(_priorityRetryAt.TryGetValue(x.Id, out var retryAt) && retryAt > now))
+                .ToList();
+
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            var inventory = await BotUser.TwitchRepository.FetchInventoryDropsAsync();
+            while (candidates.Count > 0)
+            {
+                var (campaign, broadcaster) = await SelectBroadcasterAsync(candidates, inventory, priorityCheck: true);
+                if (campaign is null)
+                {
+                    return null;
+                }
+
+                candidates.Remove(campaign);
+
+                if (broadcaster is null)
+                {
+                    Logger.LogInformation("Priority check: no live channel for {Campaign} yet", campaign.Name);
+                    BotUser.NoteCampaign(campaign, CampaignNoteKind.NoLiveChannel);
+                    continue;
+                }
+
+                var rewardGroup = await CheckDropProgress(broadcaster, campaign);
+                if (rewardGroup is null || string.IsNullOrEmpty(rewardGroup.Id) ||
+                    rewardGroup.Self.CurrentMinutesWatched > rewardGroup.ProgressCriteria.Requirements.MinutesWatched)
+                {
+                    Logger.LogInformation("Priority check: nothing left to earn for {Campaign} on {Channel}",
+                        campaign.Name, broadcaster.Login);
+                    BotUser.NoteCampaign(campaign, CampaignNoteKind.NothingLeftOnChannel);
+                    _priorityRetryAt[campaign.Id] = now + PriorityRetryAfter;
+                    continue;
+                }
+
+                Logger.LogInformation("Priority game {Game} is live: switching from {Current} to {Campaign} on {Channel}",
+                    campaign.Game?.DisplayName, current.Name, campaign.Name, broadcaster.Login);
+                return campaign;
+            }
+        }
+        // A failed check (a Twitch timeout included) leaves the watch running; only a re-pick request ends it
+        catch (Exception e) when (BotUser.CancellationTokenSource?.IsCancellationRequested != true)
+        {
+            Logger.LogWarning("Priority check failed: {Message}", e.Message);
+        }
+
+        return null;
+    }
+
     private async Task<(AbstractCampaign? campaign, User? broadcaster)> SelectBroadcasterAsync(
-        List<AbstractCampaign> campaigns, Inventory inventory)
+        List<AbstractCampaign> campaigns, Inventory inventory, bool priorityCheck = false)
     {
         User? broadcaster = null;
 
@@ -669,9 +839,18 @@ public class TwitchBot : BaseBot<TwitchUser>
                 continue;
             }
 
-            Logger.LogInformation("Checking {campaignGameDisplayName} ({campaignName})...", campaign.Game.DisplayName,
-                campaign.Name);
-            BotUser.CheckingCampaign = campaign;
+            // A priority check runs during a watch, so it neither logs a seek line nor shows as the campaign being checked
+            if (priorityCheck)
+            {
+                Logger.LogInformation("Priority check: {campaignGameDisplayName} ({campaignName})...",
+                    campaign.Game.DisplayName, campaign.Name);
+            }
+            else
+            {
+                Logger.LogInformation("Checking {campaignGameDisplayName} ({campaignName})...",
+                    campaign.Game.DisplayName, campaign.Name);
+                BotUser.CheckingCampaign = campaign;
+            }
 
             if (finishedCampaigns.Contains(campaign))
             {

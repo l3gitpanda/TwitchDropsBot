@@ -10,5 +10,7 @@ public class TwitchSettings
     public bool MinimizeInTray { get; set; } = true;
     public bool ForceTryWithTags { get; set; } = false;
     public bool OnlyConnectedAccounts { get; set; } = false;
+    // How often a watch looks for a live campaign of a priority game
+    public int PriorityCheckMinutes { get; set; } = 5;
     public string WatchManager { get; set; } = WatchManagerType.WatchRequest;
 }

@@ -54,6 +54,12 @@ public class TwitchGqlRepository : BotRepository<TwitchUser>
 
     public async Task<List<AbstractCampaign>> FetchDropsAsync()
     {
+        return (await FetchDashboardAsync()).Active;
+    }
+
+    /// <summary>The campaigns running now, plus the drop campaigns Twitch lists as not started yet.</summary>
+    public async Task<CampaignDashboard> FetchDashboardAsync()
+    {
         var query = CreateQuery("ViewerDropsDashboard");
 
         dynamic? resp = await DoGQLRequestAsync(query);
@@ -64,6 +70,8 @@ public class TwitchGqlRepository : BotRepository<TwitchUser>
             List<DropCampaign> dropCampaigns = resp.Data.CurrentUser.DropCampaigns ?? new List<DropCampaign>();
             List<RewardCampaign> rewardCampaigns = resp.Data.RewardCampaignsAvailableToUser;
 
+            var upcomingCampaigns = dropCampaigns.FindAll(dropCampaign =>
+                dropCampaign is { Status: "UPCOMING", Game: not null });
             dropCampaigns = dropCampaigns.FindAll(dropCampaign => dropCampaign is { Status: "ACTIVE" });
             rewardCampaigns.RemoveAll(campaign => campaign.Game == null);
 
@@ -83,7 +91,7 @@ public class TwitchGqlRepository : BotRepository<TwitchUser>
             var favGame = (from game in BotUser.FavouriteGames select game.ToLower()).Distinct();
             var favGamesSet = favGame;
 
-            foreach (var dropCampaign in dropCampaigns)
+            foreach (var dropCampaign in dropCampaigns.Concat(upcomingCampaigns))
             {
                 if (favGamesSet.Contains(dropCampaign.Game.DisplayName.ToLower()))
                 {
@@ -105,10 +113,10 @@ public class TwitchGqlRepository : BotRepository<TwitchUser>
 
             campaigns.AddRange(rewardCampaigns);
 
-            return campaigns;
+            return new CampaignDashboard(campaigns, upcomingCampaigns.Cast<AbstractCampaign>().ToList());
         }
 
-        return new List<AbstractCampaign>();
+        return new CampaignDashboard(new List<AbstractCampaign>(), new List<AbstractCampaign>());
     }
 
     public async Task<DropCampaign?> FetchTimeBasedDropsAsync(string dropId)

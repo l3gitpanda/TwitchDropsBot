@@ -29,6 +29,7 @@ public sealed class LiveAccount : IAccount
     private long _statusVersion;
 
     private List<AbstractCampaign>? _refreshedCampaigns;
+    private List<AbstractCampaign>? _refreshedUpcoming;
     private Inventory? _refreshedInventory;
     private DateTime? _refreshedAt;
 
@@ -102,6 +103,9 @@ public sealed class LiveAccount : IAccount
     public IReadOnlyList<AbstractCampaign> Campaigns =>
         UseRefreshed ? _refreshedCampaigns! : _user.AvailableCampaigns;
 
+    public IReadOnlyList<AbstractCampaign> UpcomingCampaigns =>
+        UseRefreshed ? _refreshedUpcoming! : _user.UpcomingCampaigns;
+
     public DateTime? CampaignsAt => UseRefreshed ? _refreshedAt : _user.AvailableCampaignsAt;
 
     public Inventory? Inventory => UseRefreshed && _refreshedInventory is not null ? _refreshedInventory : _user.Inventory;
@@ -134,18 +138,20 @@ public sealed class LiveAccount : IAccount
                 return;
             }
 
-            var campaigns = await _user.TwitchRepository.FetchDropsAsync()
+            var dashboard = await _user.TwitchRepository.FetchDashboardAsync()
                 .WaitAsync(TwitchTimeout, cancellationToken);
             var inventory = await _user.TwitchRepository.FetchInventoryDropsAsync()
                 .WaitAsync(TwitchTimeout, cancellationToken);
 
-            RememberBoxArt(campaigns);
+            RememberBoxArt(dashboard.Active);
+            RememberBoxArt(dashboard.Upcoming);
             if (inventory is not null)
             {
                 RememberBoxArt(inventory.DropCampaignsInProgress);
             }
 
-            _refreshedCampaigns = campaigns;
+            _refreshedCampaigns = dashboard.Active;
+            _refreshedUpcoming = dashboard.Upcoming;
             _refreshedInventory = inventory;
             _refreshedAt = DateTime.UtcNow;
         }
@@ -157,7 +163,8 @@ public sealed class LiveAccount : IAccount
 
     public async Task<AbstractCampaign?> GetCampaignDetailsAsync(string campaignId, CancellationToken cancellationToken)
     {
-        var campaign = Campaigns.FirstOrDefault(x => x.Id == campaignId);
+        var campaign = Campaigns.FirstOrDefault(x => x.Id == campaignId) ??
+                       UpcomingCampaigns.FirstOrDefault(x => x.Id == campaignId);
         if (campaign is not DropCampaign || campaign.TimeBasedDrops.Count > 0)
         {
             return campaign;
@@ -306,13 +313,14 @@ public sealed class LiveAccountSource : IAccountSource
     private readonly CampaignStatusStore _store;
     private readonly ConcurrentDictionary<TwitchUser, LiveAccount> _accounts = new();
 
-    public LiveAccountSource(BotRegistry registry, CampaignQueueService queue, IOptionsMonitor<BotSettings> settings,
-        CampaignStatusStore store)
+    public LiveAccountSource(BotRegistry registry, CampaignQueueService queue, PriorityGamesService priority,
+        IOptionsMonitor<BotSettings> settings, CampaignStatusStore store)
     {
         _registry = registry;
         _settings = settings;
         _store = store;
         Queue = queue;
+        Priority = priority;
 
         // Subscribe before reading the list, so no account's early log lines are missed
         _registry.UserRegistered += user =>
@@ -330,6 +338,8 @@ public sealed class LiveAccountSource : IAccountSource
     }
 
     public CampaignQueueService Queue { get; }
+
+    public PriorityGamesService Priority { get; }
 
     public CampaignStatusStore Store => _store;
 

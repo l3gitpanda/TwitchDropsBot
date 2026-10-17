@@ -20,7 +20,7 @@ public record BackendResult(int Status, object? Body = null)
 }
 
 /// <summary>
-/// Turns account state into what the page shows, and applies the page's queue and switch requests.
+/// Turns account state into what the page shows, and applies the page's queue, priority and switch requests.
 /// </summary>
 public sealed partial class WebBackend
 {
@@ -46,19 +46,37 @@ public sealed partial class WebBackend
         Version = version;
         IsDemo = demo;
         _source.Queue.Changed += _ => Changed?.Invoke();
+        _source.Priority.Changed += () => Changed?.Invoke();
     }
 
     public string Version { get; }
     public bool IsDemo { get; }
 
-    /// <summary>Raised when the queue changes, a switch is requested or a status check lands.</summary>
+    /// <summary>Raised when the queue or the priority games change, a switch is requested or a status check lands.</summary>
     public event Action? Changed;
 
     public void NotifyChanged() => Changed?.Invoke();
 
     public StateDto GetState()
     {
-        return new StateDto(Version, IsDemo, _source.Accounts.Select(BuildAccount).ToList());
+        return new StateDto(Version, IsDemo, _source.Accounts.Select(BuildAccount).ToList(), BuildPriorityGames(),
+            GameNames());
+    }
+
+    // Exact Twitch names the page can suggest for a priority game: favourites and every listed campaign's game
+    private List<string> GameNames() =>
+        _source.Accounts
+            .SelectMany(x => x.FavouriteGames.Concat(
+                x.Campaigns.Concat(x.UpcomingCampaigns).Select(GameName).OfType<string>()))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private List<PriorityGameDto> BuildPriorityGames()
+    {
+        var fromConfig = _source.Priority.FromConfig.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return _source.Priority.All.Select(x => new PriorityGameDto(x, fromConfig.Contains(x))).ToList();
     }
 
     public CampaignListDto? GetCampaigns(string accountId)
@@ -72,7 +90,9 @@ public sealed partial class WebBackend
         // Read before building, so a change made meanwhile makes the page fetch the list again
         var version = CampaignsVersion(account);
         var context = new AccountContext(this, account);
+        var running = account.Campaigns.Select(x => x.Id).ToHashSet();
         var campaigns = account.Campaigns
+            .Concat(account.UpcomingCampaigns.Where(x => !running.Contains(x.Id)))
             .Select(context.BuildCampaign)
             .OrderBy(x => x.EndsAt ?? DateTime.MaxValue)
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
@@ -115,7 +135,8 @@ public sealed partial class WebBackend
             return BackendResult.NotFound("No such account.");
         }
 
-        var listed = account.Campaigns.FirstOrDefault(x => x.Id == campaignId);
+        var listed = account.Campaigns.FirstOrDefault(x => x.Id == campaignId) ??
+                     account.UpcomingCampaigns.FirstOrDefault(x => x.Id == campaignId);
         if (listed is null)
         {
             return BackendResult.NotFound("That campaign isn't offered to this account right now.");
@@ -134,7 +155,7 @@ public sealed partial class WebBackend
         // The inventory and the live watch already say where an open campaign stands; otherwise ask a live channel
         var watching = account.Status == BotStatus.Watching && account.CurrentCampaign?.Id == campaignId;
         var inInventory = account.Inventory?.DropCampaignsInProgress.Any(x => x.Id == campaignId) == true;
-        if (listed is DropCampaign && !watching && !inInventory)
+        if (listed is DropCampaign && !watching && !inInventory && !IsUpcoming(listed))
         {
             try
             {
@@ -159,7 +180,8 @@ public sealed partial class WebBackend
             return BackendResult.NotFound("No such account.");
         }
 
-        var campaign = account.Campaigns.FirstOrDefault(x => x.Id == request.CampaignId);
+        var campaign = account.Campaigns.FirstOrDefault(x => x.Id == request.CampaignId) ??
+                       account.UpcomingCampaigns.FirstOrDefault(x => x.Id == request.CampaignId);
         if (campaign is null)
         {
             return BackendResult.NotFound("That campaign isn't offered to this account right now.");
@@ -242,6 +264,50 @@ public sealed partial class WebBackend
         return BackendResult.Ok(BuildAccount(account));
     }
 
+    /// <summary>Makes a game a priority game for every account; a bot between cycles looks again at once.</summary>
+    public BackendResult AddPriorityGame(PriorityGameRequest request)
+    {
+        // Spelled as Twitch spells it when the bot knows the game, so the list reads like the campaigns do
+        var name = request.Name?.Trim();
+        var known = GameNames().FirstOrDefault(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase));
+
+        bool added;
+        try
+        {
+            added = _source.Priority.Add(known ?? name);
+        }
+        catch (ArgumentException e)
+        {
+            return BackendResult.BadRequest(e.Message);
+        }
+
+        // A watching bot looks at its next minute, told by the priority list itself
+        if (added)
+        {
+            foreach (var account in _source.Accounts.Where(IsWaiting))
+            {
+                account.RequestReselect();
+            }
+        }
+
+        return BackendResult.Ok(BuildPriorityGames());
+    }
+
+    public BackendResult RemovePriorityGame(string? name)
+    {
+        if (_source.Priority.IsFromConfig(name))
+        {
+            return BackendResult.Conflict($"{name} is a priority game in config.json; remove it there.");
+        }
+
+        if (!_source.Priority.Remove(name))
+        {
+            return BackendResult.NotFound("That game isn't a priority game.");
+        }
+
+        return BackendResult.Ok(BuildPriorityGames());
+    }
+
     public BackendResult SwitchNow(string accountId)
     {
         var account = Find(accountId);
@@ -273,8 +339,8 @@ public sealed partial class WebBackend
     }
 
     /// <summary>
-    /// The next campaign whose progress the background pass should ask a live channel about: queued ones first,
-    /// then favourites by end date, alternating between accounts. Others are checked when opened.
+    /// The next campaign whose progress the background pass should ask a live channel about: priority games' first,
+    /// then queued ones, then favourites by end date, alternating between accounts. Others are checked when opened.
     /// </summary>
     public (IAccount Account, string CampaignId)? NextStatusCheck()
     {
@@ -307,6 +373,9 @@ public sealed partial class WebBackend
             !(account.CheckedStatus.TryGetValue(campaign.Id, out var status) && now - status.CheckedAt < RecheckAfter) &&
             !(account.StatusAttempts.TryGetValue(campaign.Id, out var attempt) && now - attempt.At < RetryAfter);
 
+        var priority = campaigns
+            .Where(x => _source.Priority.Contains(GameName(x)))
+            .OrderBy(x => EndOf(x) ?? DateTime.MaxValue);
         var queued = _source.Queue.GetCampaignIds(account.Id)
             .Select(id => campaigns.FirstOrDefault(x => x.Id == id))
             .OfType<DropCampaign>();
@@ -314,7 +383,7 @@ public sealed partial class WebBackend
             .Where(x => GameName(x) is { } game && favourites.Contains(game))
             .OrderBy(x => EndOf(x) ?? DateTime.MaxValue);
 
-        return queued.Concat(favourite).Where(Needed).Select(x => x.Id).Distinct();
+        return priority.Concat(queued).Concat(favourite).Where(Needed).Select(x => x.Id).Distinct();
     }
 
     private IAccount? Find(string accountId) =>
@@ -324,11 +393,21 @@ public sealed partial class WebBackend
     private static bool IsWaiting(IAccount account) =>
         account.Status == BotStatus.Idle && account.NextCycleAt is { } next && next > DateTime.UtcNow;
 
-    private static string? CannotQueueReason(AbstractCampaign campaign) => campaign switch
+    private string? CannotQueueReason(AbstractCampaign campaign) => campaign switch
     {
-        RewardCampaign => "Reward campaigns can't be prioritized yet; the bot handles them on its own.",
+        RewardCampaign => "Reward campaigns can't be queued; the bot handles them on its own.",
+        _ when IsUpcoming(campaign) && _source.Priority.Contains(GameName(campaign)) =>
+            $"It hasn't started yet. {GameName(campaign)} is a priority game, so the bot switches to it when it starts.",
+        _ when IsUpcoming(campaign) =>
+            $"It hasn't started yet. Make {GameName(campaign) ?? "its game"} a priority game and the bot switches to it when it starts.",
         _ => null
     };
+
+    // Twitch lists campaigns before they start; the bot watches only running ones
+    private static bool IsUpcoming(AbstractCampaign campaign) => campaign.Status == "UPCOMING";
+
+    private static DateTime? StartOf(AbstractCampaign campaign) =>
+        campaign.StartAt == default ? null : Utc(campaign.StartAt);
 
     private AccountDto BuildAccount(IAccount account)
     {
@@ -370,7 +449,22 @@ public sealed partial class WebBackend
             Utc(account.CampaignsAt),
             CampaignsVersion(account),
             account.Campaigns.Count,
-            account.OnlyFavouriteGames);
+            account.OnlyFavouriteGames,
+            NextPriority(account));
+    }
+
+    // The soonest upcoming campaign of a priority game, which the bot will switch to when it starts
+    private UpcomingDto? NextPriority(IAccount account)
+    {
+        var now = DateTime.UtcNow;
+        var next = account.UpcomingCampaigns
+            .Where(x => StartOf(x) is { } start && start > now && _source.Priority.Contains(GameName(x)))
+            .MinBy(x => StartOf(x));
+
+        return next is null
+            ? null
+            : new UpcomingDto(next.Id, next.Name, GameName(next), BoxArt(next.Game, account), StartOf(next),
+                EndOf(next));
     }
 
     // Box art goes missing on campaign objects the bot has re-fetched, so it is remembered per game
@@ -427,6 +521,7 @@ public sealed partial class WebBackend
         private readonly Dictionary<string, AbstractCampaign> _campaigns;
         private readonly Dictionary<string, DropCampaign> _inventory;
         private readonly HashSet<string> _favourites;
+        private readonly HashSet<string> _priority;
         private readonly HashSet<string> _avoided;
 
         public AccountContext(WebBackend backend, IAccount account)
@@ -438,6 +533,7 @@ public sealed partial class WebBackend
             _inventory = (account.Inventory?.DropCampaignsInProgress ?? new List<DropCampaign>())
                 .GroupBy(x => x.Id).ToDictionary(x => x.Key, x => x.First());
             _favourites = account.FavouriteGames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            _priority = backend._source.Priority.All.ToHashSet(StringComparer.OrdinalIgnoreCase);
             _avoided = account.AvoidedCampaigns.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             foreach (var campaign in _campaigns.Values)
@@ -448,6 +544,8 @@ public sealed partial class WebBackend
 
         private bool IsWatching(string campaignId) =>
             _account.Status == BotStatus.Watching && _account.CurrentCampaign?.Id == campaignId;
+
+        private bool IsPriority(string? gameName) => gameName is not null && _priority.Contains(gameName);
 
         // The live watch, then the inventory (campaigns in progress), then a live channel's answer, then what
         // earlier checks and the bot recorded. Twitch drops fully claimed campaigns from the inventory.
@@ -542,7 +640,8 @@ public sealed partial class WebBackend
                 _account.CurrentMinutesWatched,
                 _account.RequiredMinutesWatched,
                 EndOf(listed ?? campaign),
-                tiers);
+                tiers,
+                IsPriority(GameName(campaign) ?? (listed is null ? null : GameName(listed))));
         }
 
         public List<QueueItemDto> BuildQueue()
@@ -600,7 +699,9 @@ public sealed partial class WebBackend
 
             var (link, linkUrl) = LinkState(campaign);
             var gameName = GameName(campaign);
-            var resolved = Resolve(campaign);
+            var resolved = IsUpcoming(campaign)
+                ? new Resolved("upcoming", null, campaign is DropCampaign drop && !drop.CanReceiveRewards())
+                : Resolve(campaign);
 
             return new CampaignDto(
                 campaign.Id,
@@ -622,7 +723,8 @@ public sealed partial class WebBackend
                 resolved.State,
                 resolved.NeedsLink,
                 resolved.Status?.Source,
-                resolved.Status is { Source: not "live" } ? Utc(resolved.Status.CheckedAt) : null);
+                resolved.Status is { Source: not "live" } ? Utc(resolved.Status.CheckedAt) : null,
+                IsPriority(gameName));
         }
 
         public CampaignDetailDto BuildDetail(AbstractCampaign listed, AbstractCampaign details)
@@ -633,7 +735,7 @@ public sealed partial class WebBackend
                 summary = summary with { TotalMinutes = total };
             }
 
-            var resolved = Resolve(listed);
+            var resolved = IsUpcoming(listed) ? new Resolved("upcoming", null, false) : Resolve(listed);
             var tiers = new List<TierDto>();
 
             if (resolved.Status is { Tiers.Count: > 0 } status)
@@ -677,8 +779,8 @@ public sealed partial class WebBackend
                     : null,
                 restricted ? channels!.Count : 0,
                 (details as DropCampaign)?.DetailsURL ?? (listed as DropCampaign)?.DetailsURL,
-                CannotQueueReason(listed) is null,
-                CannotQueueReason(listed),
+                _backend.CannotQueueReason(listed) is null,
+                _backend.CannotQueueReason(listed),
                 resolved.Status?.Channel,
                 resolved.Status is null ? attempt?.Problem : null);
         }

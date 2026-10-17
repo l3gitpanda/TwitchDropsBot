@@ -121,6 +121,13 @@ public static class ApiEndpoints
             }
         });
 
+        secured.MapPost("/priority-games", (PriorityGameRequest request, WebBackend backend) =>
+            ToResult(backend.AddPriorityGame(request)));
+
+        // By query, since a game name can hold a slash
+        secured.MapDelete("/priority-games", (string? name, WebBackend backend) =>
+            ToResult(backend.RemovePriorityGame(name)));
+
         var account = secured.MapGroup("/accounts/{accountId}");
 
         account.MapGet("/campaigns", (string accountId, WebBackend backend) =>

@@ -2,7 +2,15 @@ namespace TwitchDropsBot.Web.Api;
 
 // What the page receives. Built from the bot's state; never carries tokens, the webhook or other config.
 
-public record StateDto(string Version, bool Demo, IReadOnlyList<AccountDto> Accounts);
+public record StateDto(string Version, bool Demo, IReadOnlyList<AccountDto> Accounts,
+    IReadOnlyList<PriorityGameDto> PriorityGames, IReadOnlyList<string> GameNames);
+
+/// <summary>A priority game. One set in config.json can only be removed there.</summary>
+public record PriorityGameDto(string Name, bool FromConfig);
+
+/// <summary>A campaign Twitch lists before it starts.</summary>
+public record UpcomingDto(string CampaignId, string CampaignName, string? GameName, string? BoxArtUrl,
+    DateTime? StartsAt, DateTime? EndsAt);
 
 public record AccountDto(
     string Id,
@@ -17,7 +25,8 @@ public record AccountDto(
     DateTime? CampaignsUpdatedAt,
     string CampaignsVersion,
     int CampaignCount,
-    bool OnlyFavourites);
+    bool OnlyFavourites,
+    UpcomingDto? NextPriority);
 
 public record WatchingDto(
     string CampaignId,
@@ -32,7 +41,8 @@ public record WatchingDto(
     int? MinutesWatched,
     int? MinutesRequired,
     DateTime? CampaignEndsAt,
-    IReadOnlyList<TierDto> Tiers);
+    IReadOnlyList<TierDto> Tiers,
+    bool IsPriority);
 
 /// <summary>One drop of a campaign. Current is null when this account's progress on it isn't known.</summary>
 public record TierDto(string Name, string? ImageUrl, int? Current, int Required, bool Claimed, bool Active);
@@ -78,7 +88,8 @@ public record CampaignDto(
     string Status,
     bool NeedsLink,
     string? StatusSource,
-    DateTime? StatusCheckedAt);
+    DateTime? StatusCheckedAt,
+    bool IsPriority);
 
 public record CampaignDetailDto(
     CampaignDto Campaign,
@@ -98,6 +109,8 @@ public record LogPageDto(IReadOnlyList<LogLineDto> Lines, long LastSeq);
 public record QueueRequest(string CampaignId, string? Position, bool SwitchNow);
 
 public record ReorderRequest(IReadOnlyList<string> CampaignIds);
+
+public record PriorityGameRequest(string? Name);
 
 public record LoginRequest(string? Password);
 

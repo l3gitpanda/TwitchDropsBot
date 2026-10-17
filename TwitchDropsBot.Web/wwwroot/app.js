@@ -22,12 +22,14 @@ const IDLE_TEXT = {
 const FILTERS = [
   ['all', 'All'],
   ['favourites', 'Favourites'],
+  ['priority', 'Priority'],
   ['queued', 'Queued'],
   ['progress', 'In progress'],
   ['unclaimed', 'Unclaimed'],
   ['done', 'Done'],
   ['linked', 'Linked / no link'],
   ['ending', 'Ending soon'],
+  ['upcoming', 'Upcoming'],
 ];
 
 const LOG_LEVELS = [
@@ -174,6 +176,12 @@ function endsText(iso) {
   return ms <= 0 ? 'ended' : `ends in ${spanText(ms)}`;
 }
 
+function startsText(iso) {
+  if (!iso) return 'no start date';
+  const ms = new Date(iso) - now();
+  return ms <= 0 ? 'starting' : `starts in ${spanText(ms)}`;
+}
+
 function agoText(iso) {
   const ms = now() - new Date(iso);
   if (ms < 60000) return 'just now';
@@ -203,6 +211,7 @@ function tickClocks() {
   for (const el of $$('[data-countdown]')) el.textContent = countdownText(el.dataset.countdown);
   for (const el of $$('[data-until]')) el.textContent = untilText(el.dataset.until);
   for (const el of $$('[data-ends]')) el.textContent = endsText(el.dataset.ends);
+  for (const el of $$('[data-starts]')) el.textContent = startsText(el.dataset.starts);
   for (const el of $$('[data-ago]')) el.textContent = agoText(el.dataset.ago);
 }
 
@@ -295,6 +304,10 @@ function setState(state) {
 }
 
 const accounts = () => store.state?.accounts ?? [];
+const priorityGames = () => store.state?.priorityGames ?? [];
+// Worked out here rather than taken from the campaign list, so a change shows before the list is fetched again
+const priorityOf = (gameName) => (gameName ? priorityGames().find((g) => g.name.toLowerCase() === gameName.toLowerCase()) ?? null : null);
+const isPriority = (c) => Boolean(priorityOf(c.gameName));
 const accountById = (id) => accounts().find((a) => a.id === id);
 const currentAccount = () => accountById(store.accountId);
 const accountSlot = (account) => (accounts().indexOf(account) % 4) + 1;
@@ -328,7 +341,10 @@ function renderShell() {
     <div class="layout">
       <div class="col-left">
         <section class="view" id="view-now" data-tab="now" aria-label="Now"></section>
-        <section class="view" id="view-queue" data-tab="queue" aria-label="Queue"></section>
+        <section class="view" id="view-queue" data-tab="queue" aria-label="Queue">
+          <div id="queue-body"></div>
+          <div id="priority-body"></div>
+        </section>
       </div>
       <div class="col-right">
         <div class="panel-switch" role="tablist" aria-label="Panel">
@@ -343,6 +359,7 @@ function renderShell() {
       ${TABS.map(([id, label, glyph]) => html`<button class="tab" role="tab" data-tab-button="${id}">${icon(glyph)}<span>${label}</span><span class="count" hidden></span></button>`)}
     </nav>`);
   renderCampaignsFrame();
+  renderPriorityFrame();
   renderActivityFrame();
 }
 
@@ -352,6 +369,7 @@ function renderAll() {
   renderTabs();
   renderNow();
   if (!store.dragging) renderQueue();
+  renderPriority();
   renderCampaignList();
   if (activityVisible()) pollLogs();
   if (campaignsVisible()) ensureCampaigns();
@@ -447,6 +465,8 @@ function renderNow() {
 
   const others = accounts().filter((a) => a.id !== account.id);
   const upNext = account.queue.filter((q) => q.campaignId !== account.watching?.campaignId).slice(0, 3);
+  const np = account.nextPriority;
+  const order = priorityGames().length ? 'priority games, then ' : '';
 
   setHtml(view, html`
     <div class="section-head"><h2>${account.login}</h2>${account.watching ? html`<span class="hint">${live('ends', account.watching.campaignEndsAt, endsText(account.watching.campaignEndsAt))}</span>` : ''}</div>
@@ -455,9 +475,10 @@ function renderNow() {
       <h2>Up next</h2>
       <button class="link-btn" data-goto="queue">${account.queue.length ? 'Edit queue' : 'Queue a campaign'}</button>
     </div>
+    ${np ? html`<div class="callout info next-priority">${icon('bolt', 'sm')}<div class="grow"><strong>${np.campaignName}</strong> (${np.gameName || 'a priority game'}) starts ${whenText(np.startsAt)}, ${live('until', np.startsAt, untilText(np.startsAt))}. The bot switches to it then.</div><button class="link-btn" data-open="${np.campaignId}">Details</button></div>` : ''}
     ${upNext.length
       ? html`<ol class="card list">${upNext.map((item, i) => queueRow(account, item, i, false))}</ol>`
-      : html`<div class="callout info">${icon('info', 'sm')}<div class="grow">Nothing queued. The bot follows its normal order: ${account.onlyFavourites ? 'favourite games only' : 'favourite games first'}, soonest-ending first. <button class="link-btn" data-goto="campaigns">Pick a campaign</button></div></div>`}
+      : html`<div class="callout info">${icon('info', 'sm')}<div class="grow">Nothing queued. The bot follows its normal order: ${order}${account.onlyFavourites ? 'favourite games only' : 'favourite games first'}, soonest-ending first. <button class="link-btn" data-goto="campaigns">Pick a campaign</button></div></div>`}
     ${others.length ? html`
       <div class="section-head"><h2>${others.length === 1 ? 'Other account' : 'Other accounts'}</h2></div>
       <div class="mini-list">${others.map(miniAccount)}</div>` : ''}`);
@@ -509,12 +530,14 @@ function heroWatching(account, error) {
   const eta = new Date(now() + left * 60000).toISOString();
   const channelUrl = w.channelLogin ? `https://www.twitch.tv/${encodeURIComponent(w.channelLogin)}` : null;
   const head = account.queue.find((q) => q.state === 'queued' && q.campaignId !== w.campaignId);
+  // A re-pick lands on the priority campaign again, so the queue can't take over from it
+  const switchTo = w.isPriority ? null : head;
 
   return html`<article class="card hero">
     <div class="hero-top">
       ${art(w.boxArtUrl, w.gameName, 'lg')}
       <div class="hero-main">
-        <span class="status good"><span class="dot live"></span>Watching</span>
+        <div class="hero-tags"><span class="status good"><span class="dot live"></span>Watching</span>${w.isPriority ? html`<span class="status busy">${icon('bolt')}Priority game</span>` : ''}</div>
         <h3 class="hero-title">${w.campaignName}</h3>
         <p class="hero-sub">${w.gameName || 'Unknown game'}${w.channelName ? html`<span class="sep">·</span>${channelUrl ? html`<a href="${channelUrl}" target="_blank" rel="noopener noreferrer">${w.channelName}</a>` : w.channelName}` : ''}</p>
       </div>
@@ -530,10 +553,11 @@ function heroWatching(account, error) {
       <span>Done around <strong>${clockFormat.format(new Date(eta))}</strong></span>
     </div>
     ${tierList(w.tiers)}
+    ${w.isPriority && head ? html`<p class="hero-sub queue-hint">The queue waits until this priority campaign is done.</p>` : ''}
     ${error}
     <div class="hero-actions">
-      ${head ? html`<button class="btn grow" data-action="switch">${icon('skip', 'sm')}<span class="clip">Switch to ${head.campaignName}</span></button>` : ''}
-      <button class="btn ${head ? 'square' : ''}" data-open="${w.campaignId}" aria-label="Campaign details">${icon('info', 'sm')}${head ? '' : 'Campaign details'}</button>
+      ${switchTo ? html`<button class="btn grow" data-action="switch">${icon('skip', 'sm')}<span class="clip">Switch to ${switchTo.campaignName}</span></button>` : ''}
+      <button class="btn ${switchTo ? 'square' : ''}" data-open="${w.campaignId}" aria-label="Campaign details">${icon('info', 'sm')}${switchTo ? '' : 'Campaign details'}</button>
     </div>
   </article>`;
 }
@@ -620,8 +644,8 @@ function queueRow(account, item, index, editable) {
 let lastQueueKey = '';
 function renderQueue() {
   const account = currentAccount();
-  const view = $('#view-queue');
-  const key = JSON.stringify(account ? [account.id, account.queue, account.onlyFavourites] : null);
+  const view = $('#queue-body');
+  const key = JSON.stringify(account ? [account.id, account.queue, account.onlyFavourites, priorityGames().length] : null);
   if (key === lastQueueKey) return;
   lastQueueKey = key;
 
@@ -632,8 +656,8 @@ function renderQueue() {
 
   const finished = account.queue.filter((q) => q.state === 'done' || q.state === 'ended' || q.state === 'unavailable');
   setHtml(view, html`
-    <div class="section-head"><h2>Priority queue</h2><span class="hint">${account.queue.length ? `${account.queue.length} queued` : ''}</span></div>
-    <p class="help">Watched first, top to bottom. When nothing here can be watched, the bot falls back to its normal order${account.onlyFavourites ? ' (favourites only)' : ''}.</p>
+    <div class="section-head"><h2>Queue</h2><span class="hint">${account.queue.length ? `${account.queue.length} queued` : ''}</span></div>
+    <p class="help">Watched ${priorityGames().length ? 'after any live campaign of a priority game' : 'first'}, top to bottom. When nothing here can be watched, the bot falls back to its normal order${account.onlyFavourites ? ' (favourites only)' : ''}.</p>
     ${account.queue.length
       ? html`<ol class="card list" id="queue-list">${account.queue.map((item, i) => queueRow(account, item, i, true))}</ol>`
       : html`<div class="card empty">${icon('queue')}<h3>Nothing queued</h3><p>Queue a campaign to watch it before anything else. Queued campaigns are farmed even if their game isn't a favourite.</p><button class="btn primary" data-goto="campaigns">${icon('plus', 'sm')}Browse campaigns</button></div>`}
@@ -770,6 +794,84 @@ async function switchNow(account) {
   }
 }
 
+// ---------------------------------------------------------------- priority games
+
+function renderPriorityFrame() {
+  setHtml($('#priority-body'), html`
+    <div class="section-head"><h2>Priority games</h2><span class="hint">every account</span></div>
+    <p class="help">Their campaigns go before the queue. While the bot watches anything else it checks every few minutes and switches as soon as one goes live, and it wakes up for one Twitch lists as starting later. Name a game as Twitch does.</p>
+    <div class="card prio-card">
+      <ul class="prio-list" id="priority-list"></ul>
+      <form class="prio-add" id="priority-form" autocomplete="off">
+        <label class="search">${icon('bolt', 'sm')}<span class="visually-hidden">Game name</span><input id="priority-input" type="text" list="priority-suggest" maxlength="100" placeholder="Add a game" enterkeyhint="done"></label>
+        <button class="btn" type="submit">${icon('plus', 'sm')}Add</button>
+      </form>
+      <datalist id="priority-suggest"></datalist>
+    </div>`);
+
+  $('#priority-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = $('#priority-input');
+    const name = input.value.trim().replace(/\s+/g, ' ');
+    if (!name) return;
+    const button = $('button[type=submit]', event.currentTarget);
+    button.disabled = true;
+    if (await addPriority(name)) input.value = '';
+    button.disabled = false;
+  });
+}
+
+let lastPriorityKey = '';
+function renderPriority() {
+  const host = $('#priority-list');
+  if (!host) return;
+  const games = priorityGames();
+  const key = JSON.stringify([games, store.state?.gameNames]);
+  if (key === lastPriorityKey) return;
+  lastPriorityKey = key;
+
+  setHtml(host, games.length
+    ? games.map((g) => html`<li class="prio-game">${icon('bolt', 'sm')}<span class="name">${g.name}</span>${g.fromConfig
+      ? html`<span class="tag" title="Set in config.json; remove it there">config.json</span>`
+      : html`<button class="btn ghost square sm" data-action="priority-remove" data-name="${g.name}" aria-label="Remove ${g.name} from the priority games">${icon('x', 'sm')}</button>`}</li>`)
+    : html`<li class="prio-empty">None yet. Add a game here, or from a campaign's details.</li>`);
+
+  const taken = new Set(games.map((g) => g.name.toLowerCase()));
+  setHtml($('#priority-suggest'), (store.state?.gameNames ?? [])
+    .filter((name) => !taken.has(name.toLowerCase()))
+    .map((name) => html`<option value="${name}"></option>`));
+}
+
+async function addPriority(name) {
+  const known = priorityOf(name);
+  if (known) {
+    toast(`${known.name} is already a priority game`);
+    return true;
+  }
+  let games;
+  try {
+    games = await api('/api/priority-games', { method: 'POST', body: { name } });
+  } catch (e) {
+    toast(e.message, { error: true });
+    return false;
+  }
+  // The bot stores a known game as Twitch spells it
+  const stored = games?.find((g) => g.name.toLowerCase() === name.toLowerCase())?.name ?? name;
+  toast(`${stored} is now a priority game`, { action: { label: 'Undo', run: () => removePriority(stored, { quiet: true }) } });
+  return true;
+}
+
+async function removePriority(name, { quiet = false } = {}) {
+  try {
+    await api(`/api/priority-games?name=${enc(name)}`, { method: 'DELETE' });
+  } catch (e) {
+    toast(e.message, { error: true });
+    return false;
+  }
+  if (!quiet) toast(`${name} is no longer a priority game`, { action: { label: 'Undo', run: () => addPriority(name) } });
+  return true;
+}
+
 // ---------------------------------------------------------------- campaigns
 
 function renderCampaignsFrame() {
@@ -834,12 +936,14 @@ function filterCampaigns(account, list) {
   const test = {
     all: () => true,
     favourites: (c) => c.isFavourite,
+    priority: isPriority,
     queued: (c) => queuePosition(account, c.id),
     progress: (c) => c.status === 'inProgress' || c.isWatching,
     unclaimed: (c) => c.status === 'waitingClaim',
     done: (c) => c.status === 'done',
     linked: (c) => c.link !== 'unlinked',
-    ending: (c) => c.endsAt && new Date(c.endsAt) < soon,
+    ending: (c) => c.status !== 'upcoming' && c.endsAt && new Date(c.endsAt) < soon,
+    upcoming: (c) => c.status === 'upcoming',
   };
   const counts = Object.fromEntries(FILTERS.map(([id]) => [id, list.filter(test[id]).length]));
 
@@ -864,7 +968,7 @@ function renderCampaignList(force = false) {
   if (!host || !account) return;
 
   const cached = store.campaigns.get(account.id);
-  const key = JSON.stringify([account.id, account.queue.map((q) => q.campaignId), account.watching?.campaignId, account.onlyFavourites, cached?.version, cached?.loading, cached?.error, store.filter, store.sort, store.search]);
+  const key = JSON.stringify([account.id, account.queue.map((q) => q.campaignId), account.watching?.campaignId, account.onlyFavourites, priorityGames().map((g) => g.name), cached?.version, cached?.loading, cached?.error, store.filter, store.sort, store.search]);
   if (!force && key === lastListKey) return;
   lastListKey = key;
 
@@ -915,7 +1019,9 @@ function campaignBadges(account, c) {
   const watching = account.watching?.campaignId === c.id;
   return html`
     ${watching ? html`<span class="badge watching"><span class="dot live"></span>Watching</span>` : ''}
-    ${c.isFavourite ? html`<span class="badge fav">${icon('star')}Favourite</span>` : account.onlyFavourites ? html`<span class="badge muted">Not a favourite</span>` : ''}
+    ${isPriority(c) ? html`<span class="badge prio">${icon('bolt')}Priority</span>` : ''}
+    ${c.status === 'upcoming' ? html`<span class="badge">${icon('clock')}Upcoming</span>` : ''}
+    ${c.isFavourite ? html`<span class="badge fav">${icon('star')}Favourite</span>` : account.onlyFavourites && !isPriority(c) ? html`<span class="badge muted">Not a favourite</span>` : ''}
     ${linkBadge(c)}
     ${c.isAvoided ? html`<span class="badge muted">Avoided</span>` : ''}`;
 }
@@ -926,6 +1032,10 @@ function dropsWord(n) {
 
 // Where a campaign stands: done, watched but unclaimed, in progress, not started, or not known yet
 function campaignStatus(c) {
+  if (c.status === 'upcoming') {
+    const prio = isPriority(c);
+    return html`<div class="row-state ${prio ? 'busy' : ''}">${icon(prio ? 'bolt' : 'clock')}<span>Starts ${whenText(c.startsAt)}${prio ? ' · the bot switches to it then' : ''}</span></div>`;
+  }
   const p = c.progress;
   switch (p || c.status === 'done' ? c.status : 'unknown') {
     case 'done':
@@ -950,14 +1060,14 @@ function campaignRow(account, c) {
       ${art(c.boxArtUrl, c.gameName)}
       <div class="row-main">
         <div class="row-title">${c.name}</div>
-        <div class="row-sub">${c.gameName || 'Unknown game'} · ${c.endsAt ? live('ends', c.endsAt, endsText(c.endsAt)) : 'no end date'}</div>
+        <div class="row-sub">${c.gameName || 'Unknown game'} · ${c.status === 'upcoming' ? live('starts', c.startsAt, startsText(c.startsAt)) : c.endsAt ? live('ends', c.endsAt, endsText(c.endsAt)) : 'no end date'}</div>
         <div class="badges">${campaignBadges(account, c)}</div>
         ${campaignStatus(c)}
       </div>
     </button>
     <div class="row-side">
       ${position ? html`<span class="qpos" title="Position in the queue">#${position}</span>`
-        : c.kind === 'drop' && !watching && !done ? html`<button class="btn square sm add-btn" data-quick-add="${c.id}" aria-label="Add ${c.name} to the queue">${icon('plus', 'sm')}</button>` : ''}
+        : c.kind === 'drop' && !watching && !done && c.status !== 'upcoming' ? html`<button class="btn square sm add-btn" data-quick-add="${c.id}" aria-label="Add ${c.name} to the queue">${icon('plus', 'sm')}</button>` : ''}
     </div>
   </li>`;
 }
@@ -1017,7 +1127,12 @@ function renderSheet() {
 
   const position = queuePosition(account, c.id);
   const watching = account.watching?.campaignId === c.id;
-  const canQueue = s.detail ? s.detail.canQueue : c.kind !== 'reward';
+  const upcoming = c.status === 'upcoming';
+  const prio = c.kind === 'drop' ? priorityOf(c.gameName) : null;
+  const canQueue = !upcoming && (s.detail ? s.detail.canQueue : c.kind !== 'reward');
+  const cannotQueueReason = upcoming
+    ? (prio ? 'It hasn\'t started yet. Its game is a priority game, so the bot switches to it when it starts.' : 'It hasn\'t started yet, so it can\'t be queued. Make its game a priority game and the bot switches to it when it starts.')
+    : s.detail?.cannotQueueReason;
   const finished = c.status === 'done' && !watching;
   const others = accounts().filter((a) => a.id !== account.id);
   const tiers = s.detail?.tiers;
@@ -1053,6 +1168,17 @@ function renderSheet() {
     }
   }
 
+  const startLine = upcoming
+    ? html`<div class="callout">${icon('clock', 'sm')}<div class="grow"><strong>Not started yet.</strong> Twitch lists it ahead of time; it can only be watched once it starts.</div></div>`
+    : '';
+
+  let priorityLine = '';
+  if (c.kind === 'drop' && c.gameName) {
+    priorityLine = prio
+      ? html`<div class="callout info">${icon('bolt', 'sm')}<div class="grow"><strong>${prio.name} is a priority game.</strong> Its campaigns go before the queue, and the bot switches to one as soon as it goes live.${prio.fromConfig ? ' Set in config.json.' : ''}</div>${prio.fromConfig ? '' : html`<button class="link-btn" data-action="priority-remove" data-name="${prio.name}">Remove</button>`}</div>`
+      : html`<div class="sheet-links"><button class="btn sm" data-action="priority-add" data-name="${c.gameName}">${icon('bolt', 'sm')}Make ${c.gameName} a priority game</button></div>`;
+  }
+
   const linkUrl = safeUrl(c.linkUrl);
   const detailsUrl = safeUrl(s.detail?.detailsUrl);
 
@@ -1062,18 +1188,20 @@ function renderSheet() {
       <div>
         <div class="eyebrow">${c.gameName || 'Unknown game'}</div>
         <h3 id="sheet-title">${c.name}</h3>
-        <div class="sub">${c.endsAt ? html`Ends ${whenText(c.endsAt)} · ${live('until', c.endsAt, untilText(c.endsAt))}` : 'No end date'}</div>
+        <div class="sub">${upcoming && c.startsAt ? html`Starts ${whenText(c.startsAt)} · ${live('until', c.startsAt, untilText(c.startsAt))}${c.endsAt ? html` · ends ${whenText(c.endsAt)}` : ''}` : c.endsAt ? html`Ends ${whenText(c.endsAt)} · ${live('until', c.endsAt, untilText(c.endsAt))}` : 'No end date'}</div>
         <div class="badges">${campaignBadges(account, c)}</div>
       </div>
       <button class="btn ghost square close" data-action="close-sheet" aria-label="Close">${icon('x')}</button>
     </header>
     <div class="sheet-body">
       ${status}
+      ${startLine}
       ${progressLine}
       ${noteLine}
+      ${priorityLine}
       ${c.link === 'unlinked' && c.status !== 'waitingClaim' ? html`<div class="callout warn">${icon('link', 'sm')}<div class="grow"><strong>${account.login} isn't linked to this game.</strong> Watching still counts, and Twitch hands the drops over once the account is linked.${linkUrl ? html` <a href="${linkUrl}" target="_blank" rel="noopener noreferrer">Link the account</a>` : ''}</div></div>` : ''}
       ${c.link === 'unlinked' && c.status === 'waitingClaim' && linkUrl ? html`<div class="sheet-links"><a class="btn sm" href="${linkUrl}" target="_blank" rel="noopener noreferrer">${icon('link', 'sm')}Link the account</a></div>` : ''}
-      ${!c.isFavourite && account.onlyFavourites && c.kind !== 'reward' ? html`<div class="callout info">${icon('star', 'sm')}<div class="grow">Not in the favourites list, so the bot only farms it while it's queued.</div></div>` : ''}
+      ${!c.isFavourite && !prio && account.onlyFavourites && c.kind !== 'reward' ? html`<div class="callout info">${icon('star', 'sm')}<div class="grow">Not in the favourites list, so the bot only farms it while it's queued.</div></div>` : ''}
       <h4>Drops${c.totalMinutes ? html` · all in ${minutesText(c.totalMinutes)}` : ''}</h4>
       ${s.loading && !tiers ? html`<div class="skeleton" data-skeleton></div>` : ''}
       ${tiers?.length ? tierList(tiers, { all: true, sheet: true }) : ''}
@@ -1091,7 +1219,7 @@ function renderSheet() {
           : html`<button class="btn" data-action="sheet-add">${icon('plus', 'sm')}Add to queue</button>
                  <button class="btn" data-action="sheet-next">${icon('top', 'sm')}Watch next</button>`}
         ${watching || finished ? '' : html`<button class="btn primary" data-action="sheet-now">${icon('play', 'sm solid')}Watch now</button>`}
-      </div>` : html`<p class="reason">${s.detail?.cannotQueueReason || 'This campaign can\'t be queued.'}</p>`}
+      </div>` : html`<p class="reason">${cannotQueueReason || 'This campaign can\'t be queued.'}</p>`}
     </footer>`);
 
   const skeleton = $('[data-skeleton]', sheet);
@@ -1332,6 +1460,8 @@ document.addEventListener('click', async (event) => {
       return;
     }
     case 'sheet-remove': return removeFromQueue(store.sheet.accountId, store.sheet.campaignId);
+    case 'priority-add': return addPriority(d.name);
+    case 'priority-remove': return removePriority(d.name);
     case 'sheet-recheck': return openCampaign(store.sheet.campaignId, store.sheet.accountId, { recheck: true });
     case 'sheet-top': return moveInQueue(accountById(store.sheet.accountId), store.sheet.campaignId, 0, 0);
     default:

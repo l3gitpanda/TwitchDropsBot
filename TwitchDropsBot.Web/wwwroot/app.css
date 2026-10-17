@@ -479,6 +479,8 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 }
 .badge .icon { width: 13px; height: 13px; stroke-width: 2.4; }
 .badge.fav .icon { color: var(--accent-ink); fill: var(--accent-ink); stroke: none; }
+.badge.prio { background: var(--accent-soft); color: var(--text); }
+.badge.prio .icon { color: var(--accent-ink); }
 .badge.linked .icon { color: var(--good); }
 .badge.unlinked .icon { color: var(--serious); }
 .badge.watching { background: var(--accent-soft); color: var(--text); }
@@ -543,6 +545,7 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 .hero { padding: 16px; }
 .hero-top { display: flex; gap: 14px; align-items: flex-start; }
 .hero-main { min-width: 0; flex: 1; }
+.hero-tags { display: flex; flex-wrap: wrap; gap: 6px 14px; }
 .hero-title { font-size: 20px; line-height: 1.22; font-weight: 750; letter-spacing: -0.01em; margin: 6px 0 3px; overflow-wrap: anywhere; }
 .hero-sub { color: var(--text-2); font-size: 14px; overflow-wrap: anywhere; }
 .hero-sub a { font-weight: 650; }
@@ -687,6 +690,34 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 
 .help { color: var(--text-2); font-size: 14px; margin: -2px 4px 12px; }
 .queue-foot { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.next-priority { margin-bottom: 10px; }
+
+/* ---------- priority games ---------- */
+
+#priority-body .section-head { margin-top: 26px; }
+.prio-card { padding: 6px 14px 14px; }
+.prio-list { list-style: none; margin: 0; padding: 0; }
+.prio-game {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  border-bottom: 1px solid var(--hairline);
+}
+.prio-game > .icon { width: 16px; height: 16px; color: var(--accent-ink); flex: none; }
+.prio-game .name { flex: 1; min-width: 0; font-weight: 650; overflow-wrap: anywhere; }
+.prio-game .tag {
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-3);
+  border: 1px dashed var(--hairline-strong);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.prio-empty { color: var(--text-3); font-size: 14px; padding: 12px 0; border-bottom: 1px solid var(--hairline); }
+.prio-add { display: flex; gap: 8px; margin-top: 12px; }
+.prio-add .search { min-width: 0; }
+.prio-add .search .icon { color: var(--accent-ink); }
 
 /* ---------- campaigns ---------- */
 

@@ -68,6 +68,12 @@ public abstract class BaseBot<TUser> where TUser : BotUser
                 waitingTime = TimeSpan.FromSeconds(BotSettings.CurrentValue.WaitingSeconds);
                 BotUser.IdleReason = BotIdleReason.DropSessionChanged;
             }
+            catch (PriorityCampaignLive ex)
+            {
+                Logger.LogDebug(ex.Message);
+                waitingTime = TimeSpan.FromSeconds(5);
+                BotUser.IdleReason = BotIdleReason.Switching;
+            }
             catch (OperationCanceledException ex)
             {
                 Logger.LogDebug(ex.Message);
@@ -99,6 +105,7 @@ public abstract class BaseBot<TUser> where TUser : BotUser
             }
         
             BotUser.Close();
+            waitingTime = LimitWait(waitingTime);
             BotUser.NextCycleAt = DateTime.UtcNow + waitingTime;
 
             // A re-pick request during the wait starts the next cycle at once
@@ -114,4 +121,7 @@ public abstract class BaseBot<TUser> where TUser : BotUser
     }
 
     protected abstract Task StartAsync();
+
+    /// <summary>Lets a bot wake earlier than planned between cycles, for something it knows starts sooner.</summary>
+    protected virtual TimeSpan LimitWait(TimeSpan waitingTime) => waitingTime;
 }

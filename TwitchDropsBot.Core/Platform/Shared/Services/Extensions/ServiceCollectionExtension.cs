@@ -24,6 +24,7 @@ public static class ServiceCollectionExtension
         services.AddSingleton<BotFactory>();
         services.AddSingleton<BotRegistry>();
         services.AddSingleton<CampaignQueueService>();
+        services.AddSingleton<PriorityGamesService>();
 
         return services;
     }
